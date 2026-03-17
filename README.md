@@ -106,7 +106,7 @@ See the full **[Bill of Materials](docs/BOM.md)** for part numbers and sourcing.
 ### 1. Clone the Repo
 
 ```bash
-git clone https://github.com/eddyCG42/treadmill-sensor.git
+git clone https://github.com/USERNAME/treadmill-sensor.git
 cd treadmill-sensor
 ```
 
@@ -143,7 +143,7 @@ sudo systemctl start treadmill-dashboard
 
 ### 6. Flash the Feather Firmware
 
-See [`firmware/README.md`](firmware/README.md) for Arduino IDE build instructions and S340 SoftDevice setup.
+See [Firmware Notes](#-firmware-notes) below and the [Adafruit nRF52 Bootloader S340 PR](https://github.com/adafruit/Adafruit_nRF52_Bootloader/pull/359) for Arduino IDE build instructions and S340 SoftDevice setup.
 
 ---
 
@@ -215,6 +215,21 @@ The Feather nRF52840 runs the **S340 SoftDevice** (not S140), which provides bot
 - Arduino IDE with Adafruit nRF52 BSP (modified for S340)
 - J-Link EDU Mini used for initial SoftDevice flashing and recovery
 - UF2 uploads work normally after initial setup
+
+### S340 SoftDevice Setup
+
+The S340 is a closed-source SoftDevice distributed by Garmin Canada. To flash it, follow the instructions in this merged PR on the Adafruit nRF52 Bootloader repo:
+
+> **[feat: add support for SoftDevice S340 — PR #359](https://github.com/adafruit/Adafruit_nRF52_Bootloader/pull/359)**
+
+In short:
+1. Register an **ANT+ Adopter** account at [thisisant.com](https://www.thisisant.com/register/) (access granted within ~1 business day)
+2. Download the **S340 v7.0.1** SoftDevice from the ANT+ resources page
+3. Follow the PR's `readme.md` to place and rename the files in the bootloader repo
+4. Uncomment the evaluation key in `nrf_sdm.h` (line 191)
+5. Flash the bootloader with `SD_NAME=s340` using a J-Link
+
+> ⚠️ The evaluation key is for development only. A commercial license key from Garmin/Dynastream is required for any product release.
 
 ---
 
