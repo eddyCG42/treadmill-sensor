@@ -1,0 +1,17 @@
+[Unit]
+Description=Treadmill Dashboard
+After=multi-user.target
+
+[Service]
+Type=simple
+User=pi
+Environment=DISPLAY=:0
+Environment=SDL_FBDEV=/dev/fb0
+WorkingDirectory=/home/pi
+ExecStartPre=/bin/sleep 5
+ExecStart=/usr/bin/python3 /home/pi/treadmill_dashboard_v8.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
