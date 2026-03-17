@@ -106,7 +106,7 @@ See the full **[Bill of Materials](docs/BOM.md)** for part numbers and sourcing.
 ### 1. Clone the Repo
 
 ```bash
-git clone https://github.com/USERNAME/treadmill-sensor.git
+git clone https://github.com/eddyCG42/treadmill-sensor.git
 cd treadmill-sensor
 ```
 
