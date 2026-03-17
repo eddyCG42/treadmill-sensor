@@ -2,7 +2,7 @@
 
 > DIY speed & heart-rate dashboard for the NordicTrack Commercial 2450, with Garmin Fenix 8 integration, live BLE heart rate, auto-pause detection, and one-tap Strava upload.
 
-<!-- Badges — update USERNAME after pushing -->
+<!-- Badges — update eddyCG42 after pushing -->
 ![License](https://img.shields.io/badge/license-GPL%20v3-blue)
 ![Platform](https://img.shields.io/badge/platform-Raspberry%20Pi-C51A4A?logo=raspberrypi)
 ![Python](https://img.shields.io/badge/python-3.9%2B-3776AB?logo=python&logoColor=white)
