@@ -42,7 +42,7 @@
 |---|---|
 | SoftDevice | S340 (BLE + ANT+) — **not** S140 |
 | Flash offset | Application starts at `0x31000` |
-| Toolchain | PlatformIO with custom board def + linker script |
+| Toolchain | Arduino IDE with Adafruit nRF52 BSP (modified for S340) |
 | Debugger | J-Link EDU Mini (SWD) |
 
 ## Passive Components

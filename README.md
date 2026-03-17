@@ -3,7 +3,7 @@
 > DIY speed & heart-rate dashboard for the NordicTrack Commercial 2450, with Garmin Fenix 8 integration, live BLE heart rate, auto-pause detection, and one-tap Strava upload.
 
 <!-- Badges — update USERNAME after pushing -->
-![License](https://img.shields.io/badge/license-MIT-blue)
+![License](https://img.shields.io/badge/license-GPL%20v3-blue)
 ![Platform](https://img.shields.io/badge/platform-Raspberry%20Pi-C51A4A?logo=raspberrypi)
 ![Python](https://img.shields.io/badge/python-3.9%2B-3776AB?logo=python&logoColor=white)
 ![Firmware](https://img.shields.io/badge/firmware-nRF52840%20%2B%20S340-00A9CE)
@@ -143,7 +143,7 @@ sudo systemctl start treadmill-dashboard
 
 ### 6. Flash the Feather Firmware
 
-See [`firmware/README.md`](firmware/README.md) for PlatformIO build instructions and S340 SoftDevice setup.
+See [`firmware/README.md`](firmware/README.md) for Arduino IDE build instructions and S340 SoftDevice setup.
 
 ---
 
@@ -159,7 +159,7 @@ treadmill-sensor/
 │   ├── BOM.md                   ← Bill of materials
 │   └── wiring.md                ← Wiring guide
 ├── firmware/
-│   └── feather-nrf52840/        ← PlatformIO project (S340 SoftDevice)
+│   └── feather-nrf52840/        ← Arduino sketch (S340 SoftDevice)
 ├── dashboard/
 │   ├── treadmill_dashboard_v8.py
 │   ├── treadmill_hr.py
@@ -212,11 +212,9 @@ The Feather nRF52840 runs the **S340 SoftDevice** (not S140), which provides bot
 - Communicates with Raspberry Pi over **USB serial** (not BLE)
 - Broadcasts speed data over **BLE** to Garmin Fenix 8
 - LSM303DLHC (accel/mag) shares the main sensor PCB
-- PlatformIO with custom board definition and linker script
+- Arduino IDE with Adafruit nRF52 BSP (modified for S340)
 - J-Link EDU Mini used for initial SoftDevice flashing and recovery
 - UF2 uploads work normally after initial setup
-
-> 📖 See the [PlatformIO migration guide](firmware/feather-nrf52840/MIGRATION.md) for details on moving from Arduino IDE.
 
 ---
 
@@ -230,7 +228,7 @@ The Feather nRF52840 runs the **S340 SoftDevice** (not S140), which provides bot
 
 ## 📝 License
 
-This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
+This project is licensed under the GNU General Public License v3.0 — see the [LICENSE](LICENSE) file for details.
 
 ---
 
