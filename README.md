@@ -35,26 +35,7 @@
 
 ## 📐 Architecture
 
-```
-┌──────────────┐  wire   ┌──────────────────┐  USB     ┌──────────────────┐  SPI    ┌────────────┐
-│  DRV5023     │ ──────► │  Feather         │ serial   │  Raspberry Pi    │ ──────► │ HyperPixel │
-│  Hall Sensor │         │  nRF52840        │ ───────► │  (EddyPi)        │         │  Display   │
-│  (separate   │         │  +LSM303 +ToF    │         │                  │         └────────────┘
-│   PCB)       │         │  (main PCB)      │         │  Web Dashboard   │
-└──────────────┘         └──────┬───────────┘         │  HR monitor      │  HTTPS
-                                │ BLE                  │  Strava uploader │ ──────► Strava API
-                                ▼                      │                  │
-                         ┌──────────────┐              │                  │
-                         │  Garmin      │              │                  │
-                         │  Fenix 8     │◄── ANT+ ────│◄── BLE ─────────│
-                         └──────────────┘              └──────────────────┘
-                                ▲                              ▲
-                           ANT+ │                         BLE  │
-                         ┌──────┴───────┐                      │
-                         │  Garmin      │──────────────────────┘
-                         │  HRM-Pro Plus│
-                         └──────────────┘
-```
+![Architecture](docs/images/architecture.png)
 
 **Over BLE** the Feather sends the Fenix 8 **speed, cadence and grade**. The Pi
 computes cadence (from the frame accelerometer) and grade (from the ToF sensor)
@@ -204,6 +185,18 @@ treadmill-sensor/
 <sub>Left: pick the fixed 400 m track or a random GPX route, with a live sensor
 check before starting. Right: the CADENCE tab — the "VERROUILLAGE DÉTECTEUR" bar
 shows the Pi footfall detector locking onto your rhythm (green = locked).</sub>
+
+| Speed calibration | Incline calibration (6 points) |
+|---|---|
+| ![Speed calibration](docs/images/calib-speed.png) | ![Incline calibration](docs/images/calib-incline.png) |
+
+<sub>Speed: hold the belt at a known km/h and tap CALIBRER 10s to learn the pace
+factor. Incline: capture the raw ToF reading at −3/0/3/6/9/12 % for a piecewise
+grade map (the firmware mirrors the 0 and 12 % points as a fallback).</sub>
+
+**End-of-run activity summary** (review, then save + auto-upload to Strava):
+
+![Activity summary](docs/images/save.png)
 
 The web dashboard (`dashboard/web_dashboard/treadmill_server.py`, a lightweight
 Python HTTP server + React/JSX kiosk UI) provides:
