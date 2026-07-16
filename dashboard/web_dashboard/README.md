@@ -1,6 +1,10 @@
-# Treadmill Dashboard — Web edition (v9)
+# Treadmill Dashboard — Web edition (v12.1)
 
-Single UI, served from the Pi to a Chromium kiosk window.
+Single UI, served from the Pi to a Chromium kiosk window. The Pi also runs the
+**cadence detector** (band-pass + autocorrelation on the Feather's `$RAW` accel
+stream) and pushes speed / cadence / grade to the Feather for the Garmin BLE
+broadcast. Fastest deploy: `bash deploy.sh` (see the coupled guide in
+`../DEPLOY_v12.md`); the manual steps below are the equivalent longhand.
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
@@ -11,7 +15,8 @@ Single UI, served from the Pi to a Chromium kiosk window.
 │                              ▼                                   │
 │                  treadmill_server.py  ◄── systemd service        │
 │                  · reads sensors, smooths, logs CSV              │
-│                  · /api/state  (10 Hz polled)                    │
+│                  · detects cadence, pushes speed/cadence/grade   │
+│                  · /api/state  (4 Hz polled)                     │
 │                  · /api/cmd    (POST actions)                    │
 │                  · serves /static/*                              │
 │                              │                                   │
@@ -30,10 +35,10 @@ web_dashboard/
 ├── treadmill_server.py     # HTTP server + sensor threads + business logic
 ├── static/                 # served at /static/* (and root file fallbacks)
 │   ├── dashboard.html      # main page (live polling)
-│   ├── tokens.jsx
-│   ├── primitives.jsx
-│   ├── layouts.jsx
-│   └── screens.jsx         # IdleScreen, RunHeader, SaveScreen, CalibrationPage
+│   ├── tokens.jsx          # design tokens + formatters
+│   ├── primitives.jsx      # Btn, Panel, Label, HR ring…
+│   ├── layouts.jsx         # CockpitLayout (run screen) + StatusBar
+│   └── screens.jsx         # IdleScreen, SaveScreen, CalibrationPage
 └── kiosk/
     ├── treadmill-server.service   # systemd unit for the server
     ├── treadmill-kiosk.sh         # Chromium kiosk launcher
@@ -117,7 +122,7 @@ pkill -f "chromium.*kiosk"
 ## API reference
 
 ### `GET /api/state`
-Returns the full snapshot used by the page. Polled every 100 ms. Notable fields:
+Returns the full snapshot used by the page. Polled every 250 ms. Notable fields:
 
 | field | type | meaning |
 |---|---|---|
@@ -128,6 +133,8 @@ Returns the full snapshot used by the page. Polled every 100 ms. Notable fields:
 | `live_incline` | %, smoothed + corrected | |
 | `live_incline_raw` | %, raw — used by calibration UI | |
 | `distance_m`, `elapsed_sec`, `cadence`, `elev_gain` | session stats | |
+| `cad_det_conf` | 0–1 | Pi cadence-detector confidence (≥0.5 = locked) |
+| `fw_version` | Feather firmware string (e.g. `v12.1`) | |
 | `pace_factor`, `inclin_offset`, `inclin_points` | calibration values | |
 | `auto_paused` | true if paused by inactivity | |
 | `calib_state`, `calib_progress` | speed-calibration recording | |
@@ -150,8 +157,10 @@ Body: `{"action": "<name>", "args": {...}}`. All actions return `{ok: true}` or 
 | `ref_speed_delta` | `{delta}` | calibration reference value |
 | `start_speed_calibration` | — | begin 10s recording |
 | `reset_pace` | — | pace_factor → 1.000 |
-| `zero_incline` | — | snapshot current raw as zero |
 | `reset_incline` | — | clear offset + points |
-| `invert_incline` | `{on: bool}` | flip sign |
-| `capture_incline_point` | `{target}` | memorise raw at target |
+| `capture_incline_point` | `{target}` | memorise raw at target (−3/0/3/6/9/12 %) |
 | `clear_incline_points` | — | wipe interpolation table |
+| `cad_record_start` / `cad_record_stop` | — | record the `$RAW` accel stream for offline cadence calibration |
+| `cad_threshold_delta` / `cad_refract_delta` | `{delta}` | tune the Feather fallback detector |
+| `feather_diag` | — | dump Feather `STATUS`/`DIAG`/`CFG_DUMP` to the logs |
+| `retry_strava` | — | force a Strava upload-queue drain |

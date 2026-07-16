@@ -77,6 +77,8 @@ See the full **[Bill of Materials](docs/BOM.md)** for part numbers and sourcing.
 
 ### Enclosures (OpenSCAD)
 
+> ⏳ **Planned — not yet in this repo** (the OpenSCAD sources are still WIP; see Roadmap).
+
 | Enclosure | Description |
 |---|---|
 | `pi-hyperpixel-clamp.scad` | Clamps Pi + HyperPixel to treadmill arm |
@@ -230,8 +232,10 @@ The Feather nRF52840 runs the **S340 SoftDevice** (not S140), which provides bot
 
 - Application flash starts at `0x31000` (S340 memory map)
 - Communicates with Raspberry Pi over **USB serial** (not BLE)
-- Broadcasts speed data over **BLE** to Garmin Fenix 8
-- LSM303DLHC (accel/mag) shares the main sensor PCB
+- Broadcasts **speed, cadence and grade** over **BLE** to Garmin Fenix 8 (the Pi
+  pushes cadence/grade via `BLE_CAD` / `BLE_INCLIN`; the firmware keeps onboard
+  fallbacks)
+- LSM303DLHC (accel/mag) + VL53L4CD (ToF) share the main sensor PCB
 - Arduino IDE with Adafruit nRF52 BSP (modified for S340)
 - J-Link EDU Mini used for initial SoftDevice flashing and recovery
 - UF2 uploads work normally after initial setup
