@@ -1,6 +1,6 @@
 # 🏃 Treadmill Sensor
 
-> DIY speed & heart-rate dashboard for the NordicTrack Commercial 2450, with Garmin Fenix 8 integration, live BLE heart rate, auto-pause detection, and one-tap Strava upload.
+> DIY speed, **cadence** & heart-rate dashboard for the NordicTrack Commercial 2450 — feeds a Garmin Fenix 8 with speed, cadence and grade over BLE, adds live BLE heart rate, ToF-based incline sensing, auto-pause, virtual GPS routes and one-tap Strava upload.
 
 <!-- Badges — update eddyCG42 after pushing -->
 ![License](https://img.shields.io/badge/license-GPL%20v3-blue)
@@ -11,21 +11,24 @@
 
 ---
 
-<!-- TODO: Add a hero photo or GIF of the dashboard running on the treadmill -->
-<!-- ![Dashboard in action](docs/images/hero.jpg) -->
+![Run screen](docs/images/cockpit.png)
+
+<sub>The in-run cockpit on the 800×480 kiosk — distance, time, HR zone, pace, live cadence and grade. (Rendered mock-up of the actual UI.)</sub>
 
 ## ✨ Features
 
 | Feature | Details |
 |---|---|
 | **Live Speed Tracking** | DRV5023 Hall-effect sensor (separate PCB) → Feather nRF52840 → Pi via USB serial |
-| **Motion / Orientation** | LSM303DLHC accelerometer/magnetometer on main Feather PCB |
-| **Heart Rate** | Garmin HRM-Pro Plus chest strap → Pi via BLE (`bleak`) + Fenix 8 via ANT+ simultaneously |
-| **Garmin Fenix 8 Integration** | Feather broadcasts speed over BLE to Fenix 8; HRM-Pro Plus sends HR over ANT+ |
-| **Dashboard** | Real-time Python + HyperPixel display (SPI), mounted on treadmill arm |
-| **Auto-Pause** | Detects belt stop → yellow "AUTO-PAUSE" state (5 s delay) |
-| **Strava Upload** | One-tap SAVE → auto-upload as treadmill activity via Strava API |
-| **Custom PCBs** | Hall sensor PCB (60 mm, JLCPCB) + main sensor PCB (Feather + LSM303DLHC) |
+| **Real Cadence** | Footfall cadence detected on the Pi from the frame accelerometer (band-pass + windowed autocorrelation), no foot pod — validated ±4 spm from walk to run, pushed to the Fenix over BLE |
+| **Incline / Grade** | VL53L4CD time-of-flight sensor reads deck tilt; 6-point calibration maps it to % grade, mirrored to the Fenix so watch grade matches the dashboard |
+| **Heart Rate** | Garmin HRM-Pro Plus chest strap → Pi via BLE (`bleak`) + Fenix 8 via ANT+ simultaneously; Karvonen HR zones |
+| **Garmin Fenix 8 Integration** | Feather broadcasts **speed + cadence + grade** over BLE to the Fenix 8; HRM-Pro Plus sends HR over ANT+ |
+| **Web Dashboard** | Python HTTP server + React/JSX kiosk UI on a HyperPixel touchscreen, mounted on the treadmill arm |
+| **Virtual Routes** | Fixed 400 m athletics track or a random pick from your GPX pool (anti-repeat) for nicer Strava maps |
+| **Auto-Pause** | Detects belt stop → yellow "AUTO-PAUSE" state |
+| **Strava Upload** | One-tap SAVE → export `.tcx`/`.fit` and auto-upload via the Strava API, with an offline retry queue |
+| **Custom PCBs** | Hall sensor PCB (60 mm, JLCPCB) + main sensor PCB (Feather + LSM303DLHC + VL53L4CD) |
 | **3D-Printable Enclosures** | OpenSCAD: Pi + HyperPixel arm clamp & Feather sensor mount |
 
 ---
@@ -36,7 +39,7 @@
 ┌──────────────┐  wire   ┌──────────────────┐  USB     ┌──────────────────┐  SPI    ┌────────────┐
 │  DRV5023     │ ──────► │  Feather         │ serial   │  Raspberry Pi    │ ──────► │ HyperPixel │
 │  Hall Sensor │         │  nRF52840        │ ───────► │  (EddyPi)        │         │  Display   │
-│  (separate   │         │  + LSM303DLHC    │         │                  │         └────────────┘
+│  (separate   │         │  +LSM303 +ToF    │         │                  │         └────────────┘
 │   PCB)       │         │  (main PCB)      │         │  Web Dashboard   │
 └──────────────┘         └──────┬───────────┘         │  HR monitor      │  HTTPS
                                 │ BLE                  │  Strava uploader │ ──────► Strava API
@@ -53,6 +56,11 @@
                          └──────────────┘
 ```
 
+**Over BLE** the Feather sends the Fenix 8 **speed, cadence and grade**. The Pi
+computes cadence (from the frame accelerometer) and grade (from the ToF sensor)
+and pushes them to the Feather, which relays them to the watch; the Feather keeps
+its own onboard estimates as a fallback if the Pi push goes stale.
+
 ---
 
 ## 🧰 Hardware
@@ -63,7 +71,8 @@ See the full **[Bill of Materials](docs/BOM.md)** for part numbers and sourcing.
 
 - **Raspberry Pi** (3B+ or 4) — dashboard host (`EddyPi`), receives speed data via USB serial, HR via BLE
 - **Adafruit Feather nRF52840** — sensor MCU on main PCB, running S340 SoftDevice (BLE + ANT+), communicates with Pi over USB serial and broadcasts speed to Garmin Fenix 8 over BLE
-- **LSM303DLHC** — accelerometer/magnetometer, on the same main PCB as the Feather
+- **LSM303DLHC** — accelerometer/magnetometer on the main PCB; the accelerometer doubles as the **cadence pickup** (footfall vibration through the frame)
+- **VL53L4CD** — time-of-flight distance sensor on the main PCB, reads deck tilt for **incline / grade** (6-point calibration → % grade)
 - **DRV5023 Hall-Effect Sensor** — on a separate 60 mm PCB, wired to the Feather, detects belt magnets
 - **HyperPixel Display** — SPI touchscreen dashboard, mounted on treadmill arm
 - **Garmin HRM-Pro Plus** — sends HR to Pi via BLE and to Garmin Fenix 8 via ANT+ simultaneously
@@ -77,7 +86,7 @@ See the full **[Bill of Materials](docs/BOM.md)** for part numbers and sourcing.
 - J1 screw terminal for wiring to main PCB
 - Status LED: NationStar NCD0603C1 (0603, yellow-green)
 
-**Main Sensor PCB** — carries the Feather nRF52840 + LSM303DLHC:
+**Main Sensor PCB** — carries the Feather nRF52840 + LSM303DLHC + VL53L4CD:
 - Connects to Hall sensor PCB via wiring
 - USB connection to Raspberry Pi for serial data
 - Designed in EasyEDA Pro
@@ -188,8 +197,13 @@ treadmill-sensor/
 
 ## 📊 Dashboard
 
-<!-- TODO: Add screenshot of the dashboard UI -->
-<!-- ![Dashboard Screenshot](docs/images/dashboard-screenshot.png) -->
+| Home / mode select | Cadence calibration |
+|---|---|
+| ![Home screen](docs/images/home.png) | ![Cadence calibration](docs/images/cadence-calibration.png) |
+
+<sub>Left: pick the fixed 400 m track or a random GPX route, with a live sensor
+check before starting. Right: the CADENCE tab — the "VERROUILLAGE DÉTECTEUR" bar
+shows the Pi footfall detector locking onto your rhythm (green = locked).</sub>
 
 The web dashboard (`dashboard/web_dashboard/treadmill_server.py`, a lightweight
 Python HTTP server + React/JSX kiosk UI) provides:
