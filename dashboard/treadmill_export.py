@@ -11,11 +11,135 @@ import csv
 import math
 import os
 import glob
-from datetime import datetime, timedelta
+import re
+from datetime import datetime, timedelta, timezone
+
+try:
+    from treadmill_routes import get_route_point, get_route_info, pick_random_route, list_routes, unload_route_waypoints
+    HAS_ROUTES = True
+except ImportError:
+    HAS_ROUTES = False
 
 LOG_DIR = os.path.expanduser("~/treadmill_logs")
 EXPORT_DIR = os.path.expanduser("~/treadmill_exports")
-BASE_ALTITUDE = 15.0  # Altitude reelle ~15m a Fort-de-France
+BASE_ALTITUDE = 15.0  # Altitude par defaut
+
+# Rough running energy cost (~1 kcal per kg per km). Body mass is unknown to
+# the sensor, so assume a value; Strava recomputes calories from its own model
+# anyway. Still beats the old flat 8 kcal/min, which ignored pace entirely.
+ASSUMED_BODY_MASS_KG = 70.0
+
+
+# Shared with the live server so the summary-screen D+ and the TCX D+ match.
+from treadmill_metrics import incline_pct_to_sin, elevation_delta
+
+
+def _body_mass_kg():
+    """Athlete mass from Pi config (falls back to the assumed default)."""
+    try:
+        import json
+        with open(os.path.expanduser("~/treadmill_config.json"), encoding="utf-8") as f:
+            v = float(json.load(f).get("body_mass_kg", ASSUMED_BODY_MASS_KG))
+        return v if 30.0 <= v <= 200.0 else ASSUMED_BODY_MASS_KG
+    except Exception:
+        return ASSUMED_BODY_MASS_KG
+
+
+# =====================================================
+# STRAVA ACTIVITY NAMING
+# The route is picked at random from the GPX library, but that choice used
+# to be discarded: every upload landed on Strava as "Treadmill Run <ts>".
+# These helpers turn the chosen route into a digestible title like
+#   "Central Park · Matin · Treadmill"
+# so the feed reads clearly and honestly flags the run as a treadmill/virtual
+# route (not a real outdoor run at those GPS coordinates).
+# =====================================================
+
+# Curated pretty names for the shipped GPX routes, keyed by route_id
+# (see treadmill_routes.route_id_from_filename). Anything not listed falls
+# back to generic cleaning of the GPX name, so new .gpx drop-ins still work.
+_ROUTE_DISPLAY_NAMES = {
+    "central_park": "Central Park",
+    "stanleypark_vancouver": "Stanley Park, Vancouver",
+    "seawall_vancouver": "Seawall, Vancouver",
+    "mont_royal": "Mont Royal",
+    "montreal_old_port": "Vieux-Port, Montréal",
+    "canal_lachine": "Canal de Lachine",
+    "paris_seine": "Seine, Paris",
+    "toronto_long": "Toronto Waterfront",
+    "saint_laurent_side": "Bords du Saint-Laurent",
+    "ile_aux_coudres": "Île aux Coudres",
+    "park_lafontaine": "Parc La Fontaine",
+    "2_5k_park_lafontaine": "Parc La Fontaine",
+    "plaine_abraham": "Plaines d'Abraham",
+    "tokyo_palace": "Tokyo, Palais Impérial",
+    "champ_martinique": "Champ de Mars, Martinique",
+    "osaka_castle": "Château d'Osaka",
+    "piste_martinique": "Piste Martinique",
+}
+
+# French particles kept lowercase when title-casing a derived name.
+_SMALL_WORDS = {"de", "du", "des", "la", "le", "les", "aux", "au", "et", "sur", "d"}
+
+
+def _time_of_day(dt):
+    """French time-of-day label matching Strava's Morning/Evening Run convention."""
+    h = dt.hour
+    if 5 <= h < 11:
+        return "Matin"
+    if 11 <= h < 14:
+        return "Midi"
+    if 14 <= h < 18:
+        return "Après-midi"
+    if 18 <= h < 22:
+        return "Soir"
+    return "Nuit"
+
+
+def _clean_route_name(raw):
+    """Best-effort prettify a raw GPX/filename route name.
+    '16k_Mont_Royal' -> 'Mont Royal',  '5k_tokyo_palace' -> 'Tokyo Palace'.
+    """
+    if not raw:
+        return "Course"
+    name = raw.strip()
+    # Strip a leading distance token: 10k_, 21km_, 2_5k_, 8k- ...
+    name = re.sub(r"^\s*\d+(?:[._]\d+)?\s*k(?:m)?[\s_\-]+", "", name, flags=re.IGNORECASE)
+    # Split camelCase runs like 'StanleyPark' / 'MyCentralParkLoop'
+    name = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", name)
+    name = name.replace("_", " ").replace("-", " ")
+    name = re.sub(r"\s+", " ", name).strip()
+    if not name:
+        return "Course"
+
+    words = []
+    for i, w in enumerate(name.split(" ")):
+        lw = w.lower()
+        if i > 0 and lw in _SMALL_WORDS:
+            words.append(lw)
+        elif w.isupper() and len(w) > 1:
+            words.append(w)  # keep acronyms as-is
+        else:
+            words.append(w[:1].upper() + w[1:].lower())
+    return " ".join(words)
+
+
+def route_display_name(route_id, raw_name=None):
+    """Human-friendly name for a route: curated map first, else cleaned raw name."""
+    if route_id in _ROUTE_DISPLAY_NAMES:
+        return _ROUTE_DISPLAY_NAMES[route_id]
+    # Strip the disambiguation suffix load_routes() adds to duplicate ids
+    # ('central_park_9' -> 'central_park') before the second lookup.
+    base_id = re.sub(r"_\d+$", "", route_id or "")
+    if base_id in _ROUTE_DISPLAY_NAMES:
+        return _ROUTE_DISPLAY_NAMES[base_id]
+    return _clean_route_name(raw_name or route_id)
+
+
+def build_activity_name(route_id, raw_name, start_time):
+    """Compose the Strava activity title, e.g. 'Central Park · Soir · Treadmill'."""
+    place = route_display_name(route_id, raw_name)
+    return f"{place} · {_time_of_day(start_time)} · Treadmill"
 
 # =====================================================
 # PISTE D'ATHLETISME - Stade Pierre-Aliker
@@ -123,8 +247,13 @@ def compute_elevation_profile(rows):
 
     for row in rows:
         try:
-            inclin_deg = float(row.get("inclin_corr", row.get("inclin_raw", 0)))
+            inclin_pct = float(row.get("inclin_corr", row.get("inclin_raw", 0)))
             distance_m = float(row.get("distance_m", 0))
+            # pace_factor is applied to displayed speed AND distance; apply it
+            # here too so the exported route length, TCX <DistanceMeters> and
+            # <Speed> all agree with what the dashboard showed live.
+            pace_factor = float(row.get("pace_factor", 1.0) or 1.0)
+            distance_m *= pace_factor
             speed_corr = float(row.get("speed_corr_kmh", 0))
             elapsed_s = float(row.get("elapsed_s", 0))
             cadence = int(row.get("cadence", 0))
@@ -135,13 +264,13 @@ def compute_elevation_profile(rows):
         delta_dist = distance_m - prev_distance
         prev_distance = distance_m
 
-        if delta_dist > 0 and abs(inclin_deg) > 0.1:
-            delta_alt = delta_dist * math.sin(math.radians(inclin_deg))
-            altitude += delta_alt
-            if delta_alt > 0:
-                total_gain += delta_alt
-            else:
-                total_loss += abs(delta_alt)
+        # Shared guard + math with the live server (glitch-guarded).
+        delta_alt = elevation_delta(delta_dist, inclin_pct)
+        altitude += delta_alt
+        if delta_alt > 0:
+            total_gain += delta_alt
+        elif delta_alt < 0:
+            total_loss += -delta_alt
 
         profile.append({
             "elapsed_s": elapsed_s,
@@ -150,7 +279,7 @@ def compute_elevation_profile(rows):
             "speed_kmh": speed_corr,
             "cadence": cadence,
             "heart_rate": heart_rate,
-            "inclin_deg": inclin_deg,
+            "inclin_pct": inclin_pct,
             "total_gain": total_gain,
             "total_loss": total_loss,
         })
@@ -158,13 +287,29 @@ def compute_elevation_profile(rows):
     return profile
 
 
-def generate_tcx(profile, start_time, sport="Running"):
+def generate_tcx(profile, start_time, sport="Running", route_id=None):
     if not profile:
         return ""
 
+    # Determine route. Waypoints are lazy-loaded by treadmill_routes — at
+    # this point route_info["waypoints"] is None even for valid routes.
+    # The previous check `if route_info.get("waypoints")` was therefore
+    # ALWAYS false, silently falling back to the Martinique synthetic
+    # track even in RANDOM mode (visible in TCX files as the 14.602° lat
+    # of Stade Pierre-Aliker). Trigger the lazy load by fetching point 0;
+    # if it returns None, the route really is unusable and we fall back.
+    use_virtual_route = False
+    route_info = None
+    if HAS_ROUTES and route_id and route_id != "piste_martinique":
+        if get_route_point(route_id, 0) is not None:
+            route_info = get_route_info(route_id)
+            use_virtual_route = True
+
     total_time = profile[-1]["elapsed_s"]
     total_dist = profile[-1]["distance_m"]
-    total_calories = int(total_time / 60 * 8)
+    # Running energy cost ~1.036 kcal/kg/km — scales with distance instead of
+    # the old flat 8 kcal/min that ignored pace entirely.
+    total_calories = max(1, int((total_dist / 1000.0) * _body_mass_kg() * 1.036))
 
     lines = []
     lines.append('<?xml version="1.0" encoding="UTF-8"?>')
@@ -204,9 +349,22 @@ def generate_tcx(profile, start_time, sport="Running"):
         t = start_time + timedelta(seconds=point["elapsed_s"])
         time_str = t.strftime("%Y-%m-%dT%H:%M:%SZ")
 
-        # Position GPS sur la piste d'athletisme
-        x_m, y_m = generate_track_point(point["distance_m"])
-        lat, lng = track_xy_to_latlon(x_m, y_m)
+        # Position GPS
+        if use_virtual_route:
+            gps = get_route_point(route_id, point["distance_m"])
+            lat, lng = gps[0], gps[1]
+            # Use route base altitude + treadmill incline delta
+            if route_info:
+                base_alt = route_info.get("base_altitude", BASE_ALTITUDE)
+                # Keep treadmill-measured altitude changes relative to route base
+                alt_delta = point["altitude"] - BASE_ALTITUDE
+                altitude = base_alt + alt_delta
+            else:
+                altitude = point["altitude"]
+        else:
+            x_m, y_m = generate_track_point(point["distance_m"])
+            lat, lng = track_xy_to_latlon(x_m, y_m)
+            altitude = point["altitude"]
 
         lines.append('          <Trackpoint>')
         lines.append(f'            <Time>{time_str}</Time>')
@@ -214,7 +372,7 @@ def generate_tcx(profile, start_time, sport="Running"):
         lines.append(f'              <LatitudeDegrees>{lat:.7f}</LatitudeDegrees>')
         lines.append(f'              <LongitudeDegrees>{lng:.7f}</LongitudeDegrees>')
         lines.append('            </Position>')
-        lines.append(f'            <AltitudeMeters>{point["altitude"]:.2f}</AltitudeMeters>')
+        lines.append(f'            <AltitudeMeters>{altitude:.2f}</AltitudeMeters>')
         lines.append(f'            <DistanceMeters>{point["distance_m"]:.2f}</DistanceMeters>')
 
         if point.get("heart_rate", 0) > 0:
@@ -255,7 +413,13 @@ def generate_tcx(profile, start_time, sport="Running"):
     return "\n".join(lines)
 
 
-def export_activity(csv_path, output_dir=None):
+def export_activity(csv_path, output_dir=None, route_id=None):
+    """
+    Export CSV to TCX with virtual GPS route.
+    route_id: 'piste_martinique' for track, 'random' for auto-pick,
+              or a specific route id from treadmill_routes.py.
+              None defaults to 'random'.
+    """
     if output_dir is None:
         output_dir = EXPORT_DIR
     os.makedirs(output_dir, exist_ok=True)
@@ -269,25 +433,54 @@ def export_activity(csv_path, output_dir=None):
         return None, "Aucune donnee valide"
 
     basename = os.path.basename(csv_path)
+    # start_time_local drives the activity title (time-of-day must be LOCAL).
     try:
         ts_str = basename.replace("run_", "").replace(".csv", "")
-        start_time = datetime.strptime(ts_str, "%Y%m%d_%H%M%S")
+        start_time_local = datetime.strptime(ts_str, "%Y%m%d_%H%M%S")
     except ValueError:
-        start_time = datetime.now()
+        start_time_local = datetime.now()
 
-    tcx_content = generate_tcx(profile, start_time)
+    # Route selection
+    if route_id is None:
+        route_id = "piste_martinique"
+
+    total_dist_km = profile[-1]["distance_m"] / 1000.0
+
+    if route_id == "random" and HAS_ROUTES:
+        route_id = pick_random_route(total_dist_km)
+
+    # The TCX <Time> fields are stamped with a trailing "Z" (UTC), so the
+    # timestamps must actually be UTC. The filename is local time; interpret
+    # it as local and convert, otherwise Strava shows the run 4-5h off.
+    start_time_utc = start_time_local.astimezone(timezone.utc)
+    tcx_content = generate_tcx(profile, start_time_utc, route_id=route_id)
 
     tcx_filename = basename.replace(".csv", ".tcx")
     tcx_path = os.path.join(output_dir, tcx_filename)
     with open(tcx_path, "w") as f:
         f.write(tcx_content)
 
+    # Free route waypoints memory
+    if HAS_ROUTES and route_id != "piste_martinique":
+        try:
+            unload_route_waypoints(route_id)
+        except:
+            pass
+
     last = profile[-1]
     total_time_min = last["elapsed_s"] / 60.0
-    total_dist_km = last["distance_m"] / 1000.0
     avg_pace = total_time_min / total_dist_km if total_dist_km > 0.01 else 0
     pace_min = int(avg_pace)
     pace_sec = int((avg_pace - pace_min) * 60)
+
+    raw_route_name = None
+    if HAS_ROUTES and route_id != "piste_martinique":
+        ri = get_route_info(route_id)
+        if ri:
+            raw_route_name = ri["name"]
+
+    route_name = route_display_name(route_id, raw_route_name)
+    strava_name = build_activity_name(route_id, raw_route_name, start_time_local)
 
     summary = {
         "duration_min": total_time_min,
@@ -297,6 +490,8 @@ def export_activity(csv_path, output_dir=None):
         "elevation_loss": last["total_loss"],
         "points": len(profile),
         "tcx_path": tcx_path,
+        "route": route_name,
+        "strava_name": strava_name,
     }
 
     return tcx_path, summary
@@ -320,9 +515,26 @@ def list_activities():
 
 if __name__ == "__main__":
     import sys
-    if len(sys.argv) > 1:
-        csv_path = sys.argv[1]
-    else:
+
+    if len(sys.argv) > 1 and sys.argv[1] == "routes":
+        if HAS_ROUTES:
+            print("=== Routes Virtuelles ===\n")
+            for r in list_routes():
+                print(f"  {r['id']:20s}  {r['distance_km']:6.1f} km  {r['name']}")
+        else:
+            print("Module treadmill_routes.py non trouvé")
+        sys.exit(0)
+
+    csv_path = None
+    route_id = "piste_martinique"
+
+    for arg in sys.argv[1:]:
+        if arg.startswith("--route="):
+            route_id = arg.split("=", 1)[1]
+        elif not csv_path:
+            csv_path = arg
+
+    if not csv_path:
         activities = list_activities()
         if not activities:
             print("Aucune activite trouvee dans", LOG_DIR)
@@ -330,7 +542,7 @@ if __name__ == "__main__":
         csv_path = activities[0]["path"]
         print(f"Export: {os.path.basename(csv_path)}")
 
-    tcx_path, result = export_activity(csv_path)
+    tcx_path, result = export_activity(csv_path, route_id=route_id)
     if tcx_path is None:
         print(f"Erreur: {result}")
         sys.exit(1)
@@ -342,6 +554,5 @@ if __name__ == "__main__":
     print(f"  Pace:     {result['avg_pace']}")
     print(f"  D+:       {result['elevation_gain']:.1f} m")
     print(f"  D-:       {result['elevation_loss']:.1f} m")
-    print(f"  Piste:    Stade Pierre-Aliker ({get_track_perimeter():.0f}m/tour)")
+    print(f"  Route:    {result['route']}")
     print(f"\nUpload: https://www.strava.com/upload/select")
-    print(f"NE PAS taguer 'Treadmill' pour garder l'elevation!")

@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=800, initial-scale=1, user-scalable=no" />
+<title>Treadmill Dashboard</title>
+<style>
+  /* Self-hosted webfonts — vendored by setup.sh into static/vendor/fonts/.
+     Previously @import'd from fonts.googleapis.com; that broke layout
+     ("icon sizes changed by themselves") whenever the Pi booted offline
+     because Chromium silently fell back to system-ui with different metrics. */
+  @import url('/static/vendor/fonts/fonts.css');
+  html, body {
+    margin: 0; padding: 0;
+    background: #06080c;
+    font-family: 'Barlow', system-ui, sans-serif;
+    color: #e8edf5;
+    overflow: hidden;
+    height: 100%;
+    -webkit-user-select: none; user-select: none;
+    -webkit-tap-highlight-color: transparent;
+    touch-action: manipulation;
+  }
+  * { box-sizing: border-box; }
+  button { font-family: inherit; }
+  @keyframes pulse {
+    0%   { box-shadow: 0 0 0 0 currentColor; }
+    70%  { box-shadow: 0 0 0 6px rgba(0,0,0,0); }
+    100% { box-shadow: 0 0 0 0 rgba(0,0,0,0); }
+  }
+  .stage {
+    position: fixed; inset: 0;
+    background: #06080c;
+    display: flex; align-items: center; justify-content: center;
+  }
+  /* Real device: full bleed 800x480, no bezel */
+  .viewport {
+    width: 800px; height: 480px;
+    background: #0a0d12;
+    overflow: hidden;
+    position: relative;
+  }
+  /* Connection-lost overlay */
+  .offline {
+    position: absolute; inset: 0;
+    background: rgba(6,8,12,0.92);
+    display: flex; align-items: center; justify-content: center;
+    flex-direction: column; gap: 14px;
+    color: #fbbf24; z-index: 999;
+    font-family: 'JetBrains Mono', monospace;
+  }
+  .offline .big { font-size: 28px; font-weight: 800; letter-spacing: 2px; }
+  .offline .small { font-size: 13px; color: #8b95a7; letter-spacing: 1px; }
+</style>
+</head>
+<body>
+
+<div id="root"></div>
+<div id="offline" class="offline" style="display:none">
+  <div class="big">⟳ RECONNEXION…</div>
+  <div class="small">Serveur capteurs injoignable</div>
+</div>
+
+<script src="/static/vendor/react.production.min.js"></script>
+<script src="/static/vendor/react-dom.production.min.js"></script>
+<script src="/static/vendor/babel.min.js"></script>
+
+<script type="text/babel" src="/static/tokens.jsx"></script>
+<script type="text/babel" src="/static/primitives.jsx"></script>
+<script type="text/babel" src="/static/layouts.jsx"></script>
+<script type="text/babel" src="/static/screens.jsx"></script>
+
+<script type="text/babel">
+const { useState, useEffect, useRef, useCallback } = React;
+
+// ---------- API client ----------
+async function apiCmd(action, args = {}) {
+  try {
+    await fetch('/api/cmd', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action, args }),
+    });
+  } catch (e) {
+    console.warn('cmd failed', action, e);
+  }
+}
+
+function useLiveState(pollMs = 100) {
+  const [state, setState] = useState(null);
+  const [online, setOnline] = useState(true);
+  const failsRef = useRef(0);
+
+  useEffect(() => {
+    let stop = false;
+    let timer = null;
+    const tick = async () => {
+      if (stop) return;
+      try {
+        const r = await fetch('/api/state', { cache: 'no-store' });
+        if (!r.ok) throw new Error('http ' + r.status);
+        const j = await r.json();
+        setState(j);
+        failsRef.current = 0;
+        setOnline(true);
+      } catch (e) {
+        failsRef.current++;
+        if (failsRef.current >= 3) setOnline(false);
+      }
+      if (!stop) timer = setTimeout(tick, pollMs);
+    };
+    tick();
+    return () => { stop = true; if (timer) clearTimeout(timer); };
+  }, [pollMs]);
+
+  return [state, online];
+}
+
+// ---------- Strava status pill ----------
+// Hidden when nothing is pending. When pending > 0, shows a clickable pill
+// "STRAVA · N ⟳" that forces a queue drain. The error from the most recent
+// failed attempt surfaces as a hover tooltip so we don't waste header pixels
+// on log text. Color: amber while pending, red if the last attempt failed
+// recently (within 10 min).
+function StravaStatus({ strava, onRetry }) {
+  const [busy, setBusy] = useState(false);
+  if (!strava || strava.pending_count <= 0) return null;
+  // Clamp the now-vs-server delta to >= 0 so a Pi cold-boot before NTP sync
+  // (or a browser ahead of server) doesn't flip the pill into "stale" mode.
+  const errAge = Math.max(0, Date.now() / 1000 - strava.last_error_at);
+  const recentErr = strava.last_error && errAge < 600;
+  const color = recentErr ? TOKENS.red : TOKENS.amber;
+  const title = strava.last_error
+    ? `${strava.pending_count} en attente · dernier échec: ${strava.last_error}`
+    : `${strava.pending_count} upload(s) Strava en attente`;
+  const handler = async () => {
+    if (busy) return;
+    setBusy(true);
+    try { await onRetry(); } finally {
+      // Hold the disable for 500ms so a double-tap can't fire two POSTs.
+      // The drain itself is lock-protected server-side, but the cosmetic
+      // flicker of the pill is what we're guarding against here.
+      setTimeout(() => setBusy(false), 500);
+    }
+  };
+  return (
+    <button
+      onClick={handler}
+      disabled={busy}
+      title={title}
+      style={{
+        background: 'transparent',
+        border: `1px solid ${color}`,
+        color: color,
+        borderRadius: 6,
+        padding: '4px 10px',
+        fontSize: 10,
+        fontWeight: 800,
+        letterSpacing: 1,
+        fontFamily: "'JetBrains Mono', monospace",
+        cursor: busy ? 'wait' : 'pointer',
+        opacity: busy ? 0.6 : 1,
+        display: 'flex',
+        alignItems: 'center',
+        gap: 6,
+      }}
+    >
+      <span>STRAVA · {strava.pending_count}</span>
+      <span style={{ fontSize: 12, lineHeight: 1 }}>⟳</span>
+    </button>
+  );
+}
+
+// ---------- App ----------
+function App() {
+  // 250 ms: the server tick + Feather report at ~1-2 Hz, so 10 Hz polling was
+  // 4-5x the useful rate (and a disk/JSON hit per poll). 250 ms feels live.
+  const [state, online] = useLiveState(250);
+
+  // Toggle offline banner
+  useEffect(() => {
+    const el = document.getElementById('offline');
+    if (el) el.style.display = online ? 'none' : 'flex';
+  }, [online]);
+
+  if (!state) {
+    return (
+      <div className="stage">
+        <div className="viewport" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#8b95a7', fontFamily: "'JetBrains Mono', monospace", letterSpacing: 2 }}>
+          INITIALISATION…
+        </div>
+      </div>
+    );
+  }
+
+  // Build a session shape that the existing layouts/screens understand.
+  const session = {
+    distance: state.distance_m,
+    elapsedSec: state.elapsed_sec,
+    speed: state.live_speed,
+    paceMult: state.pace_factor,
+    incline: state.live_incline,
+    elevGain: state.elev_gain,
+    cadence: state.cadence,
+    hr: state.live_hr,
+    hrAvg: state.hr_avg,
+    hrMax: state.hr_max,
+  };
+
+  const screen = state.screen;
+  const mode = state.mode;
+  const ble = state.ble_on;
+
+  const goScreen = (s) => apiCmd('set_screen', { screen: s });
+
+  // ---------- screen body ----------
+  let body;
+  if (screen === 'calibration') {
+    body = (
+      <CalibrationPage
+        onBack={() => apiCmd('set_screen', { screen: 'idle' })}
+        liveSpeed={state.live_speed_raw}
+        liveIncline={state.live_incline_raw}
+        refSpeed={state.ref_speed}
+        paceFactor={state.pace_factor}
+        inclinePoints={state.inclin_points}
+        calibState={state.calib_state}
+        calibProgress={state.calib_progress}
+        onRefSpeedDelta={(d) => apiCmd('ref_speed_delta', { delta: d })}
+        onCalibrateSpeed={() => apiCmd('start_speed_calibration')}
+        onResetSpeed={() => apiCmd('reset_pace')}
+        onCaptureInclinePoint={(t) => apiCmd('capture_incline_point', { target: t })}
+        onClearInclinePoints={() => apiCmd('clear_incline_points')}
+        onResetIncline={() => apiCmd('reset_incline')}
+        onInclineOffsetDelta={(d) => apiCmd('incline_delta', { delta: d })}
+        cadDynamic={state.cad_dynamic}
+        cadSpm={state.cad_spm}
+        cadSteps={state.cad_steps}
+        cadDetConf={state.cad_det_conf}
+        imuOk={state.imu_ok}
+        cadThreshold={state.cad_threshold}
+        cadRefractMs={state.cad_refract_ms}
+        onCadThresholdDelta={(d) => apiCmd('cad_threshold_delta', { delta: d })}
+        onCadRefractDelta={(d) => apiCmd('cad_refract_delta', { delta: d })}
+        cadRecording={state.raw_recording}
+        cadRawLines={state.raw_lines}
+        onCadRecordStart={() => apiCmd('cad_record_start')}
+        onCadRecordStop={() => apiCmd('cad_record_stop')}
+      />
+    );
+  } else if (screen === 'idle') {
+    body = (
+      <IdleScreen
+        mode={mode}
+        setMode={(m) => apiCmd('set_mode', { mode: m })}
+        onStart={() => apiCmd('start')}
+        onCalibration={() => goScreen('calibration')}
+        ble={ble}
+        setBle={() => apiCmd('toggle_ble')}
+        liveSpeed={state.live_speed}
+        liveIncline={state.live_incline}
+        liveHR={state.live_hr}
+        routeCount={state.route_count}
+        routeMinKm={state.route_min_km}
+        routeMaxKm={state.route_max_km}
+        lastRun={{
+          date: state.last_save_msg || '—',
+          mode: mode, dist: '—', time: '—', pace: '—', elev: '—',
+        }}
+      />
+    );
+  } else if (screen === 'save') {
+    body = (
+      <SaveScreen
+        session={session} mode={mode}
+        onSave={() => apiCmd('save')}
+        onDiscard={() => apiCmd('discard')}
+        onResume={() => apiCmd('resume_from_save')}
+      />
+    );
+  } else {
+    // running or paused
+    body = (
+      <>
+        <RunHeader
+          state={screen === 'paused' ? 'PAUSED' : 'RUNNING'}
+          mode={mode}
+          paceMult={state.pace_factor}
+          onPause={() => apiCmd('pause')}
+          onResume={() => apiCmd('resume')}
+          onStop={() => apiCmd('stop')}
+        />
+        <CockpitLayout session={session} />
+      </>
+    );
+  }
+
+  // ---------- title bar (idle only) ----------
+  let titleBar = null;
+  if (screen === 'idle') {
+    titleBar = (
+      <div style={{
+        height: 56, padding: '0 16px',
+        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+        background: TOKENS.bgInset, borderBottom: `1px solid ${TOKENS.border}`,
+      }}>
+        <div style={{ display: 'flex', alignItems: 'baseline', gap: 14 }}>
+          <span style={{ fontSize: 20, fontWeight: 800, color: TOKENS.text, letterSpacing: 2 }}>TREADMILL</span>
+          <span style={{ fontSize: 11, color: TOKENS.textFaint, letterSpacing: 1, fontFamily: "'JetBrains Mono', monospace" }}>v9 · web</span>
+        </div>
+        <div style={{ display: 'flex', gap: 14, alignItems: 'center' }}>
+          <StatusItem label="USB" color={state.usb_connected ? TOKENS.green : TOKENS.textFaint} />
+          <StatusItem label="BLE" color={ble ? (state.ble_connected ? TOKENS.green : TOKENS.amber) : TOKENS.textFaint} pulse={ble && !state.ble_connected} />
+          <StatusItem label="HR"  color={state.hr_connected ? TOKENS.green : TOKENS.textFaint} />
+          {/* ToF indicator: only red when the Feather is connected and the
+              sensor explicitly reports failure. When USB is down we have no
+              ground truth, so we hide the chip rather than mislead. */}
+          {state.usb_connected && state.tof_ok === false && (
+            <StatusItem label="TOF" color={TOKENS.red} pulse />
+          )}
+          <StravaStatus
+            strava={state.strava}
+            onRetry={() => apiCmd('retry_strava')}
+          />
+          <span style={{ fontSize: 11, color: TOKENS.textDim, fontFamily: "'JetBrains Mono', monospace" }}>{state.now}</span>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="stage">
+      <div className="viewport" data-screen-label={`Screen — ${screen.toUpperCase()}`}>
+        <div style={{
+          width: '100%', height: '100%',
+          display: 'flex', flexDirection: 'column',
+          background: TOKENS.bg, color: TOKENS.text,
+        }}>
+          {titleBar}
+          {body}
+          {(screen === 'idle' || screen === 'running' || screen === 'paused') && (
+            <StatusBar
+              state={screen === 'paused' ? 'PAUSED' : screen === 'running' ? 'RUNNING' : 'IDLE'}
+              data={state}
+            />
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+
+</body>
+</html>

@@ -36,3 +36,13 @@ desktop.ini
 # === EasyEDA exports (keep Gerbers, ignore temp) ===
 pcb/easyeda/*.tmp
 pcb/easyeda/*.bak
+
+# === Local venv / data / vendored assets (added v12.1) ===
+treadmill-env/
+**/static/vendor/
+cadraw_*.csv
+Cadence*.xlsx
+.treadmill_route_history.json
+.upload_queue.json
+treadmill_config.json
+treadmill_logs/

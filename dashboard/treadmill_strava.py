@@ -20,7 +20,13 @@ import json
 import os
 import time
 import glob
+import threading
 import requests
+
+# Serializes token refresh. Strava rotates the refresh_token on every grant;
+# two concurrent refreshes (drain thread + a manual CLI call) could race and
+# save a stale token over the fresh one, bricking auth until re-setup.
+_refresh_lock = threading.Lock()
 
 CONFIG_DIR = os.path.expanduser("~")
 STRAVA_TOKEN_FILE = os.path.join(CONFIG_DIR, "strava_token.json")
@@ -44,6 +50,11 @@ def load_strava_config():
 def save_strava_config(config):
     with open(STRAVA_CONFIG_FILE, "w") as f:
         json.dump(config, f, indent=2)
+    # Holds client_secret — readable only by owner.
+    try:
+        os.chmod(STRAVA_CONFIG_FILE, 0o600)
+    except OSError:
+        pass
 
 def load_token():
     if os.path.exists(STRAVA_TOKEN_FILE):
@@ -54,6 +65,12 @@ def load_token():
 def save_token(token):
     with open(STRAVA_TOKEN_FILE, "w") as f:
         json.dump(token, f, indent=2)
+    # Holds the refresh_token — anyone with this can mint access tokens
+    # against the linked Strava account forever. Readable only by owner.
+    try:
+        os.chmod(STRAVA_TOKEN_FILE, 0o600)
+    except OSError:
+        pass
 
 
 # ==================================
@@ -104,7 +121,7 @@ def setup():
         "client_secret": client_secret,
         "code": code,
         "grant_type": "authorization_code"
-    })
+    }, timeout=15)
 
     if resp.status_code != 200:
         print(f"Erreur: {resp.status_code} - {resp.text}")
@@ -134,24 +151,37 @@ def refresh_token_if_needed():
     if token.get("expires_at", 0) > time.time() + 300:
         return token["access_token"]
 
-    # Refresh
-    resp = requests.post(STRAVA_TOKEN_URL, data={
-        "client_id": config["client_id"],
-        "client_secret": config["client_secret"],
-        "refresh_token": token["refresh_token"],
-        "grant_type": "refresh_token"
-    })
+    with _refresh_lock:
+        # Re-read under the lock: another thread may have just refreshed while
+        # we waited, in which case the stored token is now valid — reuse it
+        # instead of spending our (already-rotated) refresh_token again.
+        token = load_token() or token
+        if token.get("expires_at", 0) > time.time() + 300:
+            return token["access_token"]
 
-    if resp.status_code != 200:
-        print(f"[STRAVA] Token refresh failed: {resp.status_code}")
-        return None
+        # Refresh — bounded timeout so a hung Strava endpoint can't wedge
+        # the upload thread (which is daemon=True but still pins resources).
+        try:
+            resp = requests.post(STRAVA_TOKEN_URL, data={
+                "client_id": config["client_id"],
+                "client_secret": config["client_secret"],
+                "refresh_token": token["refresh_token"],
+                "grant_type": "refresh_token"
+            }, timeout=10)
+        except requests.RequestException as e:
+            print(f"[STRAVA] Token refresh network error: {e}")
+            return None
 
-    new_token = resp.json()
-    # Preserve athlete info from old token
-    if "athlete" not in new_token and "athlete" in token:
-        new_token["athlete"] = token["athlete"]
-    save_token(new_token)
-    return new_token["access_token"]
+        if resp.status_code != 200:
+            print(f"[STRAVA] Token refresh failed: {resp.status_code}")
+            return None
+
+        new_token = resp.json()
+        # Preserve athlete info from old token
+        if "athlete" not in new_token and "athlete" in token:
+            new_token["athlete"] = token["athlete"]
+        save_token(new_token)
+        return new_token["access_token"]
 
 
 def is_configured():
@@ -184,18 +214,30 @@ def upload_tcx(tcx_path, name=None, description=None):
     headers = {"Authorization": f"Bearer {access_token}"}
 
     with open(tcx_path, "rb") as f:
-        resp = requests.post(
-            STRAVA_UPLOAD_URL,
-            headers=headers,
-            files={"file": (os.path.basename(tcx_path), f, "application/xml")},
-            data={
-                "data_type": "tcx",
-                "name": name,
-                "description": description,
-            }
-        )
+        try:
+            resp = requests.post(
+                STRAVA_UPLOAD_URL,
+                headers=headers,
+                files={"file": (os.path.basename(tcx_path), f, "application/xml")},
+                data={
+                    "data_type": "tcx",
+                    "name": name,
+                    "description": description,
+                    # external_id lets Strava reject duplicate uploads of the
+                    # same activity on retry — basename is unique per run.
+                    "external_id": os.path.basename(tcx_path),
+                },
+                timeout=30,
+            )
+        except requests.RequestException as e:
+            return False, f"Upload network error: {e}"
 
     if resp.status_code not in (200, 201):
+        # A retry of an already-accepted upload comes back rejected as a
+        # duplicate (matched via external_id). That's success, not failure —
+        # otherwise the queue re-POSTs the same file every 5 min for 50 tries.
+        if "duplicate" in resp.text.lower():
+            return True, "Deja sur Strava (duplicate)"
         return False, f"Upload failed: {resp.status_code} - {resp.text}"
 
     result = resp.json()
@@ -204,17 +246,25 @@ def upload_tcx(tcx_path, name=None, description=None):
     # Poll for processing status
     for _ in range(10):
         time.sleep(2)
-        check = requests.get(
-            f"{STRAVA_UPLOAD_URL}/{upload_id}",
-            headers=headers
-        )
+        try:
+            check = requests.get(
+                f"{STRAVA_UPLOAD_URL}/{upload_id}",
+                headers=headers,
+                timeout=10,
+            )
+        except requests.RequestException:
+            break
         if check.status_code == 200:
             status = check.json()
             if status.get("activity_id"):
                 activity_id = status["activity_id"]
                 return True, f"OK! strava.com/activities/{activity_id}"
             if status.get("error"):
-                return False, f"Strava: {status['error']}"
+                err = str(status["error"])
+                # Same reasoning as above: a duplicate means it's already there.
+                if "duplicate" in err.lower():
+                    return True, "Deja sur Strava (duplicate)"
+                return False, f"Strava: {err}"
             # Still processing
         else:
             break

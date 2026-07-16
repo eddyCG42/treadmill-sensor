@@ -1,0 +1,31 @@
+# REFERENCE TEMPLATE — NOT DEPLOYED BY deploy.sh.
+# deploy.sh generates the active unit via create_server_unit() to substitute
+# $USER_NAME / $WEB / $HOME_DIR / $PYTHON_BIN dynamically.
+# Keep this file in sync if you want it to be useful as documentation,
+# or delete it to avoid confusion. Editing this file does NOT affect the
+# installed unit until deploy.sh's create_server_unit() is also updated.
+
+[Unit]
+Description=Treadmill Dashboard HTTP Server
+After=network-online.target bluetooth.service
+Wants=network-online.target bluetooth.service
+
+[Service]
+Type=simple
+User=eddycg
+WorkingDirectory=/home/eddycg/treadmill_dashboard/web_dashboard
+ExecStart=/usr/bin/python3 /home/eddycg/treadmill_dashboard/web_dashboard/treadmill_server.py --port 8080
+Restart=on-failure
+RestartSec=3
+# USB serial + bluetooth access
+SupplementaryGroups=dialout bluetooth
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/eddycg/treadmill_config.json /home/eddycg/treadmill_logs /home/eddycg/treadmill_exports /home/eddycg/.cache
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

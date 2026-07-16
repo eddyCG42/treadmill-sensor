@@ -37,7 +37,7 @@
 │  DRV5023     │ ──────► │  Feather         │ serial   │  Raspberry Pi    │ ──────► │ HyperPixel │
 │  Hall Sensor │         │  nRF52840        │ ───────► │  (EddyPi)        │         │  Display   │
 │  (separate   │         │  + LSM303DLHC    │         │                  │         └────────────┘
-│   PCB)       │         │  (main PCB)      │         │  Dashboard v8    │
+│   PCB)       │         │  (main PCB)      │         │  Web Dashboard   │
 └──────────────┘         └──────┬───────────┘         │  HR monitor      │  HTTPS
                                 │ BLE                  │  Strava uploader │ ──────► Strava API
                                 ▼                      │                  │
@@ -131,15 +131,19 @@ Create `~/strava_config.json` on your Pi:
 
 ### 4. Pair the HRM-Pro Plus
 
-The dashboard connects via BLE using `bleak`. Update the MAC address in `treadmill_hr.py` to match your strap.
+The dashboard connects via BLE using `bleak`. Set your strap's MAC as `hr_mac`
+in `~/treadmill_config.json` (with `hr_max` / `hr_rest` for the Karvonen zones).
 
-### 5. Install the Systemd Service
+### 5. Install & Run (dashboard + kiosk)
 
 ```bash
-sudo cp systemd/treadmill-dashboard.service /etc/systemd/system/
-sudo systemctl enable treadmill-dashboard
-sudo systemctl start treadmill-dashboard
+cd dashboard/web_dashboard
+bash deploy.sh   # installs the systemd services, fetches vendored React/Babel, starts everything
 ```
+
+`deploy.sh` generates and enables the `treadmill-server` (system) and
+`treadmill-kiosk` (user) units. See [`dashboard/DEPLOY_v12.md`](dashboard/DEPLOY_v12.md)
+for the full coupled firmware + Pi deployment guide.
 
 ### 6. Flash the Feather Firmware
 
@@ -153,27 +157,31 @@ See [Firmware Notes](#-firmware-notes) below and the [Adafruit nRF52 Bootloader 
 treadmill-sensor/
 ├── README.md
 ├── LICENSE
-├── .gitignore
+├── .gitignore / .gitattributes
 ├── docs/
-│   ├── images/                  ← Photos, screenshots, diagrams
-│   ├── BOM.md                   ← Bill of materials
-│   └── wiring.md                ← Wiring guide
+│   └── BOM.md                       ← Bill of materials
 ├── firmware/
-│   └── feather-nrf52840/        ← Arduino sketch (S340 SoftDevice)
+│   └── feather-nrf52840/
+│       └── treadmill_sensor_v11_21.ino   ← Arduino sketch (internal v12.1)
 ├── dashboard/
-│   ├── treadmill_dashboard_v8.py
-│   ├── treadmill_hr.py
-│   ├── treadmill_export.py
-│   ├── treadmill_strava.py
-│   └── requirements.txt
-├── enclosures/
-│   ├── pi-hyperpixel-clamp.scad
-│   └── feather-sensor-mount.scad
+│   ├── treadmill_cadence.py         ← Pi-side footfall / cadence detector
+│   ├── treadmill_metrics.py         ← shared speed / incline / elevation math
+│   ├── treadmill_routes.py          ← GPX virtual routes (random + fixed track)
+│   ├── treadmill_export.py          ← TCX / FIT activity export
+│   ├── treadmill_hr.py              ← BLE heart-rate monitor
+│   ├── treadmill_strava.py          ← Strava OAuth + upload
+│   ├── treadmill_strava_queue.py    ← offline upload queue
+│   ├── cadence_calibrate.py         ← offline cadence-calibration tool
+│   ├── requirements.txt
+│   ├── DEPLOY_v12.md / RECORD_CADENCE.md
+│   └── web_dashboard/
+│       ├── treadmill_server.py      ← HTTP server + run state machine
+│       ├── deploy.sh / setup.sh
+│       ├── static/                  ← dashboard.html + *.jsx (React, in-browser Babel)
+│       └── kiosk/                   ← systemd units + Chromium kiosk launcher
 ├── pcb/
-│   └── easyeda/                 ← Gerber exports, schematic PDF
-├── systemd/
-│   └── treadmill-dashboard.service
-└── strava_config.json.example   ← Template (no secrets)
+│   └── easyeda/                     ← Gerber exports, schematic PDF
+└── strava_config.json.example       ← Template (no secrets)
 ```
 
 ---
@@ -183,13 +191,18 @@ treadmill-sensor/
 <!-- TODO: Add screenshot of the dashboard UI -->
 <!-- ![Dashboard Screenshot](docs/images/dashboard-screenshot.png) -->
 
-The dashboard (`treadmill_dashboard_v8.py`) provides:
+The web dashboard (`dashboard/web_dashboard/treadmill_server.py`, a lightweight
+Python HTTP server + React/JSX kiosk UI) provides:
 
 - **Live speed** from the Hall-effect sensor (via Feather → USB serial)
-- **Heart rate** graph from HRM-Pro Plus (BLE via `bleak`)
-- **Distance & duration** tracking
-- **Auto-pause** with 5-second delay and yellow visual indicator
-- **SAVE button** → exports `.fit`/`.tcx` and auto-uploads to Strava
+- **Real cadence** — band-pass + windowed-autocorrelation footfall detection on
+  the Pi from the frame accelerometer, pushed to Garmin over BLE (validated ±4 spm)
+- **Heart rate** from HRM-Pro Plus (BLE via `bleak`) with Karvonen HR zones
+- **Incline** — 6-point ToF calibration, mirrored to Garmin so grade matches
+- **Distance & duration** tracking, elevation from live grade
+- **Auto-pause** with delay and yellow visual indicator
+- **Virtual routes** — fixed athletics track or a random pick from your GPX pool
+- **SAVE button** → exports `.tcx`/`.fit` and auto-uploads to Strava (offline queue)
 
 ---
 
@@ -235,9 +248,10 @@ In short:
 
 ## 🗺️ Roadmap
 
-- [ ] Random GPS route generation for non-interval Strava exports (Quebec + worldwide)
+- [x] Random GPS route generation for non-interval Strava exports (Quebec + worldwide)
+- [x] Web-based dashboard (Python HTTP server + React kiosk UI)
+- [x] Real cadence detection from the frame accelerometer (Garmin footpod parity)
 - [ ] Improved enclosure design with snap-fit
-- [ ] Web-based dashboard alternative (Flask/FastAPI)
 
 ---
 

@@ -1,0 +1,31 @@
+[Unit]
+# User-mode systemd unit. Installed to ~/.config/systemd/user/treadmill-kiosk.service
+# and enabled via `systemctl --user enable --now treadmill-kiosk.service`.
+#
+# We migrated here from XDG autostart (~/.config/autostart/) because the .desktop
+# entry was no longer firing reliably on recent Pi OS releases (labwc/Wayland
+# desktop processes the directory differently than LXDE did).
+#
+# graphical-session.target is set up by the desktop session manager once the
+# user's GUI is ready, so DISPLAY / WAYLAND_DISPLAY / XDG_RUNTIME_DIR are already
+# in the user-systemd environment and Chromium can find a display.
+Description=Treadmill Kiosk (Chromium fullscreen on HyperPixel)
+After=graphical-session.target treadmill-server.service
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/home/eddycg/treadmill_dashboard/web_dashboard/kiosk/treadmill-kiosk.sh
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/tmp /run/user
+# Send the kiosk script's stdout/stderr to the user journal so we can see
+# what's happening with `journalctl --user -u treadmill-kiosk -n 100`.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=graphical-session.target

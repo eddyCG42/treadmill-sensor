@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Treadmill Kiosk
+Comment=Chromium fullscreen on the dashboard
+Exec=/home/eddycg/treadmill_dashboard/web_dashboard/kiosk/treadmill-kiosk.sh
+X-GNOME-Autostart-enabled=true
+NoDisplay=false
