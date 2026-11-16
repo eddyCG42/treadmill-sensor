@@ -79,7 +79,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now treadmill-server.service
 
 # 5. Verify the server
-curl http://localhost:8080/api/health
+curl http://localhost:8080/api/health   # ok=false + tick_age_s if the 1 Hz tick is stuck
 #  → {"ok": true, "ts": ...}
 
 # 6. Install the Chromium autostart
@@ -138,7 +138,9 @@ Returns the full snapshot used by the page. Polled every 250 ms. Notable fields:
 | `pace_factor`, `inclin_offset`, `inclin_points` | calibration values | |
 | `auto_paused` | true if paused by inactivity | |
 | `calib_state`, `calib_progress` | speed-calibration recording | |
-| `usb_connected`, `ble_connected`, `hr_connected` | connection flags | |
+| `usb_connected`, `ble_connected`, `hr_connected` | connection flags (`usb_connected` = Feather port open **and** `$DATA` < 3 s old) | |
+| `sensor_age_s` | seconds since the last Feather `$DATA` line | |
+| `hr_state` | `starting` / `scanning` / `connecting` / `connected` / `adapter_error` / `dead` | drives the HR status chip |
 
 ### `POST /api/cmd`
 Body: `{"action": "<name>", "args": {...}}`. All actions return `{ok: true}` or `{ok: false, error: ...}`.

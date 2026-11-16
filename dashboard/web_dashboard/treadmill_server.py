@@ -47,12 +47,19 @@ try:
 except ImportError:
     strava_queue = None
 try:
-    from treadmill_hr import start_hr_monitor, get_hr
+    from treadmill_hr import start_hr_monitor, get_hr, release_hr_link
 except ImportError:
+    # Was silent: HR just stayed grey forever. Say why, and report it as a
+    # state the dashboard can show.
+    logging.getLogger("treadmill_server").error(
+        "treadmill_hr unavailable, heart rate disabled", exc_info=True)
     start_hr_monitor = None
 
+    def release_hr_link():
+        pass
+
     def get_hr():
-        return {"bpm": 0, "connected": False, "device_name": ""}
+        return {"bpm": 0, "connected": False, "device_name": "", "state": "dead"}
 
 
 # =====================================================================
@@ -69,6 +76,21 @@ DEFAULT_HOST = "127.0.0.1"
 ALLOW_PRIVATE_NETWORKS = os.environ.get("TREADMILL_ALLOW_PRIVATE_NET", "1") != "0"
 API_TOKEN = os.environ.get("TREADMILL_API_TOKEN", "").strip()
 SENSOR_STALE_AFTER_S = 3.0
+# The 1 Hz tick thread must never stall this long (save/export under the lock
+# takes a few s at most); beyond it the process exits and systemd restarts it.
+TICK_WATCHDOG_S = 60.0
+_last_tick = [time.monotonic()]
+
+
+def _json_finite(obj: Any) -> Any:
+    """Copy of obj with NaN/Infinity floats replaced by 0 (strict JSON)."""
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else 0.0
+    if isinstance(obj, dict):
+        return {k: _json_finite(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_finite(v) for v in obj]
+    return obj
 
 logging.basicConfig(
     level=os.environ.get("TREADMILL_LOG_LEVEL", "INFO").upper(),
@@ -284,6 +306,11 @@ sensor_data: dict[str, Any] = {
 data_lock = threading.Lock()
 serial_port: Optional[serial.Serial] = None
 serial_lock = threading.Lock()
+# Set by a failed/timed-out write; the serial thread reopens the port.
+serial_link_suspect = threading.Event()
+SERIAL_WRITE_TIMEOUT_S = 0.5
+# No $DATA for this long on an open port = Feather mute -> close and reopen.
+SERIAL_SILENCE_REOPEN_S = 5.0
 
 
 # =====================================================================
@@ -311,14 +338,22 @@ def find_serial_port() -> Optional[str]:
 
 
 def send_command(cmd: str) -> bool:
+    # Bounded write (port opened with write_timeout) and no flush(): flush() is
+    # tcdrain(), which waits forever if the Feather's loop() stops draining its
+    # USB RX — that froze the tick thread (and /api/state) for 52 s and wedged
+    # the link for good. A timed-out write flags the link for a reopen instead.
     with serial_lock:
         if serial_port and serial_port.is_open:
             try:
                 serial_port.write(f"{cmd}\n".encode("utf-8"))
-                serial_port.flush()
                 return True
+            except serial.SerialTimeoutException:
+                LOGGER.warning("Serial write timed out for %s (Feather not reading)", cmd)
+                serial_link_suspect.set()
+                return False
             except Exception:
                 LOGGER.warning("Serial write failed for command %s", cmd, exc_info=True)
+                serial_link_suspect.set()
                 return False
     LOGGER.debug("Dropped serial command with no active port: %s", cmd)
     return False
@@ -562,6 +597,7 @@ def serial_thread_fn() -> None:
     global serial_port
 
     config_synced = False
+    mute_reopens = 0
     while True:
         port_name = find_serial_port()
         if not port_name:
@@ -573,7 +609,9 @@ def serial_thread_fn() -> None:
 
         sp = None
         try:
-            sp = serial.Serial(port_name, SERIAL_BAUD, timeout=1)
+            sp = serial.Serial(port_name, SERIAL_BAUD, timeout=1,
+                               write_timeout=SERIAL_WRITE_TIMEOUT_S)
+            serial_link_suspect.clear()
             with serial_lock:
                 serial_port = sp
             with data_lock:
@@ -594,13 +632,32 @@ def serial_thread_fn() -> None:
                 cadence_detector.reset()
                 send_command("CAD_RAW:1")
 
+            # Watchdog: an enumerated-but-mute Feather (loop() wedged, or CDC
+            # line state lost after a bus reset) never raises, so readline just
+            # times out forever. Reopen when $DATA stops or a write timed out —
+            # close/reopen re-asserts DTR and re-runs the sync.
+            opened_at = time.time()
             while sp.is_open:
                 line = _readline(sp)
                 if line is None:
                     break
-                if not line:
-                    continue
-                _handle_serial_line(line)
+                if line:
+                    _handle_serial_line(line)
+                with data_lock:
+                    last_data = sensor_data.get("last_update", 0.0)
+                silent_s = time.time() - max(last_data, opened_at)
+                if last_data > opened_at:
+                    mute_reopens = 0
+                if silent_s > SERIAL_SILENCE_REOPEN_S:
+                    mute_reopens += 1
+                    log = LOGGER.error if mute_reopens >= 3 else LOGGER.warning
+                    log("No $DATA from Feather for %.0f s, reopening %s (attempt %d)%s",
+                        silent_s, port_name, mute_reopens,
+                        " - Feather looks wedged, power-cycle it" if mute_reopens >= 3 else "")
+                    break
+                if serial_link_suspect.is_set():
+                    LOGGER.warning("Serial write failure, reopening %s", port_name)
+                    break
         except Exception:
             LOGGER.warning("Serial loop failed on %s", port_name, exc_info=True)
 
@@ -859,6 +916,7 @@ class App:
         /api/state — a locked phone or dropped Wi-Fi silently stopped the run.
         """
         raw = self._sensor_snapshot()
+        cmds: list[str] = []
         with self._lock:
             if time.time() - raw.get("last_update", 0.0) > SENSOR_STALE_AFTER_S:
                 raw = {**raw, "speed_kmh": 0.0, "speed_ms": 0.0, "cadence": 0}
@@ -906,17 +964,19 @@ class App:
             # Push the Pi's 6-point calibrated incline to the Feather so Garmin
             # shows the SAME grade as the dashboard (the firmware relays it and
             # falls back to its own mapping only if this push goes stale).
+            # Queued here, sent after releasing _lock: a slow serial write must
+            # never block /api/state.
             if self._sensor_available(raw):
-                send_command(f"BLE_INCLIN:{inclin:.2f}")
+                cmds.append(f"BLE_INCLIN:{inclin:.2f}")
                 # Push the Pi-detected cadence the same way (firmware broadcasts
                 # it to Garmin while fresh). Only once the detector is live, so a
                 # cold start leaves the Feather on its own fallback.
                 if det_fresh:
-                    send_command(f"BLE_CAD:{det_spm}")
+                    cmds.append(f"BLE_CAD:{det_spm}")
                 # Re-arm the raw stream well before the firmware's 60-min auto-off.
                 now_t = time.time()
                 if now_t - getattr(self, "_last_cadraw_arm", 0.0) > 600:
-                    send_command("CAD_RAW:1")
+                    cmds.append("CAD_RAW:1")
                     self._last_cadraw_arm = now_t
 
             self._tick_auto_pause(speed)
@@ -942,6 +1002,9 @@ class App:
                 if hr["bpm"] > self.hr_max:
                     self.hr_max = hr["bpm"]
 
+        for c in cmds:
+            send_command(c)
+
     def snapshot(self, raw: dict) -> dict:
         """Read-only view for /api/state. No side effects — see tick()."""
         route_count, route_min_km, route_max_km = _route_catalogue()
@@ -959,7 +1022,9 @@ class App:
                 "hr_max": self.hr_max,
                 "ble_on": raw.get("ble_on", True),
                 "ble_connected": raw.get("ble_connected", False),
-                "usb_connected": raw.get("serial_connected", False),
+                # Port open is not enough: a mute Feather keeps the port open.
+                "usb_connected": self._sensor_available(raw),
+                "sensor_age_s": round(min(time.time() - raw.get("last_update", 0.0), 9999.0), 1),
                 "tof_ok": raw.get("tof_ok", False),
                 "fw_version": raw.get("fw_version", ""),
                 "live_speed": round(self._disp_speed, 2),
@@ -970,6 +1035,7 @@ class App:
                 "live_incline_raw": round(raw.get("inclinaison", 0.0), 2),
                 "live_hr": hr["bpm"],
                 "hr_connected": hr["connected"],
+                "hr_state": hr.get("state", "dead"),
                 "distance_m": round(self._disp_distance, 2),
                 "elapsed_sec": round(self._elapsed_unlocked(), 1),
                 "cadence": self._disp_cadence,
@@ -1389,7 +1455,9 @@ class Handler(BaseHTTPRequestHandler):
     timeout = 30
 
     def log_message(self, fmt, *args):
-        LOGGER.info("%s - %s", self.address_string(), fmt % args)
+        # DEBUG: the dashboard polls 4x/s, INFO flooded journald and drowned
+        # the lines that matter ([HR], serial warnings).
+        LOGGER.debug("%s - %s", self.address_string(), fmt % args)
 
     def _client_ip(self) -> str:
         return (self.client_address or ("", 0))[0]
@@ -1446,7 +1514,13 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _send_json(self, obj: dict, code: int = 200) -> None:
-        self._send(code, json.dumps(obj).encode("utf-8"), "application/json")
+        # A NaN/Infinity would serialise as invalid JSON and r.json() in the
+        # dashboard would reject every poll -> permanent "RECONNEXION".
+        try:
+            body = json.dumps(obj, allow_nan=False)
+        except ValueError:
+            body = json.dumps(_json_finite(obj), allow_nan=False)
+        self._send(code, body.encode("utf-8"), "application/json")
 
     def _send_static(self, rel: str) -> None:
         rel = rel.lstrip("/")
@@ -1482,7 +1556,9 @@ class Handler(BaseHTTPRequestHandler):
                 raw = dict(sensor_data)
             return self._send_json(APP.snapshot(raw))
         if parsed.path == "/api/health":
-            return self._send_json({"ok": True, "ts": time.time()})
+            tick_age = time.monotonic() - _last_tick[0]
+            return self._send_json({"ok": tick_age < TICK_WATCHDOG_S, "ts": time.time(),
+                                    "tick_age_s": round(tick_age, 1)})
         if parsed.path.startswith("/static/"):
             return self._send_static(parsed.path[len("/static/") :])
         if "/" not in parsed.path[1:]:
@@ -1559,9 +1635,23 @@ def main() -> None:
                 APP.tick()
             except Exception:
                 LOGGER.exception("app tick failed")
+            _last_tick[0] = time.monotonic()
             time.sleep(1.0)
 
+    def tick_watchdog_fn() -> None:
+        # Last line of defence: if the tick thread is stuck (deadlock, blocked
+        # I/O) the server is useless while still answering /api/health. Exit
+        # non-zero so systemd (Restart=on-failure) brings it back clean.
+        while True:
+            time.sleep(5.0)
+            stuck = time.monotonic() - _last_tick[0]
+            if stuck > TICK_WATCHDOG_S:
+                LOGGER.critical("app tick stuck for %.0f s, exiting for systemd restart", stuck)
+                logging.shutdown()
+                os._exit(3)
+
     threading.Thread(target=app_tick_thread_fn, daemon=True).start()
+    threading.Thread(target=tick_watchdog_fn, daemon=True).start()
 
     if start_hr_monitor:
         try:
@@ -1587,6 +1677,7 @@ def main() -> None:
                     serial_port.close()
         except Exception:
             LOGGER.debug("Serial close during shutdown failed", exc_info=True)
+        release_hr_link()
         threading.Thread(target=httpd.shutdown, daemon=True).start()
 
     signal.signal(signal.SIGTERM, _shutdown)

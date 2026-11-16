@@ -210,4 +210,15 @@ function StatusItem({ label, color, value, pulse = false }) {
   );
 }
 
-Object.assign(window, { Btn, Panel, Label, Metric, Dot, Stepper, ModeBadge, HRRing, StatusItem });
+// HR chip props from /api/state: green connected, pulsing amber while
+// searching/connecting, red when Bluetooth or the HR manager is broken (a grey
+// dot used to hide all of these behind the same "not connected").
+function hrStatusProps(data) {
+  const st = data.hr_state || (data.hr_connected ? 'connected' : 'scanning');
+  if (data.hr_connected || st === 'connected') return { color: TOKENS.green };
+  if (st === 'adapter_error') return { color: TOKENS.red, pulse: true, value: 'BT' };
+  if (st === 'dead') return { color: TOKENS.red, value: 'OFF' };
+  return { color: TOKENS.amber, pulse: true };
+}
+
+Object.assign(window, { Btn, Panel, Label, Metric, Dot, Stepper, ModeBadge, HRRing, StatusItem, hrStatusProps });

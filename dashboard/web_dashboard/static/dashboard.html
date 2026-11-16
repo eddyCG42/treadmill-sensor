@@ -74,17 +74,42 @@
 const { useState, useEffect, useRef, useCallback } = React;
 
 // ---------- API client ----------
+// Every request gets a deadline: Chrome never times out a pending response on
+// its own, so one stalled /api/state used to freeze the poll loop forever
+// (frozen numbers, no RECONNEXION overlay, reload needed).
+async function fetchWithTimeout(url, opts = {}, ms = 1500) {
+  const ctl = new AbortController();
+  const to = setTimeout(() => ctl.abort(), ms);
+  try {
+    return await fetch(url, { ...opts, signal: ctl.signal });
+  } finally {
+    clearTimeout(to);
+  }
+}
+
 async function apiCmd(action, args = {}) {
   try {
-    await fetch('/api/cmd', {
+    await fetchWithTimeout('/api/cmd', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ action, args }),
-    });
+    }, 5000);
   } catch (e) {
     console.warn('cmd failed', action, e);
   }
 }
+
+// Reload the page only when the server answers: reloading while it is down
+// would leave the kiosk on Chrome's error page with no JS to recover.
+async function reloadIfServerUp() {
+  try {
+    const r = await fetchWithTimeout('/api/health', { cache: 'no-store' }, 2000);
+    if (r.ok) { location.reload(); return true; }
+  } catch (e) { /* server down: keep the overlay and keep polling */ }
+  return false;
+}
+
+const STALE_RELOAD_MS = 20000;
 
 function useLiveState(pollMs = 100) {
   const [state, setState] = useState(null);
@@ -94,18 +119,23 @@ function useLiveState(pollMs = 100) {
   useEffect(() => {
     let stop = false;
     let timer = null;
+    let lastOk = Date.now();
     const tick = async () => {
       if (stop) return;
       try {
-        const r = await fetch('/api/state', { cache: 'no-store' });
+        const r = await fetchWithTimeout('/api/state', { cache: 'no-store' }, 1500);
         if (!r.ok) throw new Error('http ' + r.status);
         const j = await r.json();
         setState(j);
         failsRef.current = 0;
+        lastOk = Date.now();
         setOnline(true);
       } catch (e) {
         failsRef.current++;
         if (failsRef.current >= 3) setOnline(false);
+        // Long outage with the server reachable again = page in a bad state;
+        // a fresh load is the reliable way back.
+        if (Date.now() - lastOk > STALE_RELOAD_MS && await reloadIfServerUp()) return;
       }
       if (!stop) timer = setTimeout(tick, pollMs);
     };
@@ -114,6 +144,28 @@ function useLiveState(pollMs = 100) {
   }, [pollMs]);
 
   return [state, online];
+}
+
+// ---------- Error boundary ----------
+// Without it, any render exception unmounts the whole tree (black screen,
+// polling stopped) until someone reloads by hand.
+class ErrorBoundary extends React.Component {
+  constructor(props) { super(props); this.state = { err: null }; }
+  static getDerivedStateFromError(err) { return { err }; }
+  componentDidCatch(err, info) {
+    console.error('dashboard render crash', err, info);
+    const retry = async () => { if (!(await reloadIfServerUp())) setTimeout(retry, 3000); };
+    setTimeout(retry, 3000);
+  }
+  render() {
+    if (!this.state.err) return this.props.children;
+    return (
+      <div className="offline">
+        <div className="big">⟳ RECHARGEMENT…</div>
+        <div className="small">Erreur d'affichage : {String(this.state.err.message || this.state.err)}</div>
+      </div>
+    );
+  }
 }
 
 // ---------- Strava status pill ----------
@@ -311,7 +363,7 @@ function App() {
         <div style={{ display: 'flex', gap: 14, alignItems: 'center' }}>
           <StatusItem label="USB" color={state.usb_connected ? TOKENS.green : TOKENS.textFaint} />
           <StatusItem label="BLE" color={ble ? (state.ble_connected ? TOKENS.green : TOKENS.amber) : TOKENS.textFaint} pulse={ble && !state.ble_connected} />
-          <StatusItem label="HR"  color={state.hr_connected ? TOKENS.green : TOKENS.textFaint} />
+          <StatusItem label="HR" {...hrStatusProps(state)} />
           {/* ToF indicator: only red when the Feather is connected and the
               sensor explicitly reports failure. When USB is down we have no
               ground truth, so we hide the chip rather than mislead. */}
@@ -350,7 +402,7 @@ function App() {
   );
 }
 
-ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+ReactDOM.createRoot(document.getElementById('root')).render(<ErrorBoundary><App /></ErrorBoundary>);
 </script>
 
 </body>

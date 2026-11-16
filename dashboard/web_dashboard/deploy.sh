@@ -106,6 +106,26 @@ fi
 echo "  → installed $CHROMIUM_PKG"
 sudo apt install -y -qq python3-serial unclutter curl x11-xserver-utils
 
+# Persistent journal: Pi OS keeps it in RAM by default, so every reboot wiped
+# the evidence of a dropout or an HR failure. Capped to spare the SD card.
+if [ ! -d /var/log/journal ]; then
+  echo "  enabling persistent journal (/var/log/journal, max 200M)"
+  sudo mkdir -p /var/log/journal /etc/systemd/journald.conf.d
+  printf '[Journal]\nStorage=persistent\nSystemMaxUse=200M\n' \
+    | sudo tee /etc/systemd/journald.conf.d/treadmill.conf > /dev/null
+  sudo systemd-tmpfiles --create --prefix /var/log/journal
+  sudo systemctl restart systemd-journald
+fi
+
+# Never let the kernel autosuspend the Feather's USB link (Adafruit VID 239a).
+UDEV_RULE=/etc/udev/rules.d/99-treadmill-feather.rules
+if [ ! -f "$UDEV_RULE" ]; then
+  echo 'ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="239a", TEST=="power/control", ATTR{power/control}="on"' \
+    | sudo tee "$UDEV_RULE" > /dev/null
+  sudo udevadm control --reload-rules
+  sudo udevadm trigger --subsystem-match=usb --attr-match=idVendor=239a || true
+fi
+
 # -------- 3. Vendor JS libs --------
 echo "[3/7] Fetching vendor JS libs…"
 bash "$WEB/setup.sh"

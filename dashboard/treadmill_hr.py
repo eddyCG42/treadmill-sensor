@@ -36,6 +36,9 @@ hr_data = {
     # False once the background manager thread has died, so the dashboard can
     # tell "searching" apart from "manager crashed, HR is dead until restart".
     "manager_alive": True,
+    # What the manager is doing, for the dashboard: starting | scanning |
+    # connecting | connected | adapter_error | dead.
+    "state": "starting",
 }
 hr_lock = threading.Lock()
 
@@ -89,45 +92,100 @@ def parse_hr_measurement(data):
     return hr
 
 
-async def _drop_stale_link(BleakClient):
-    """Best-effort: drop any ACL link BlueZ still holds to the known strap.
+def _set_state(state: str) -> None:
+    with hr_lock:
+        hr_data["state"] = state
+
+
+async def _bluetoothctl(*args, timeout=8.0) -> str:
+    """Run one bluetoothctl command, return its stdout ("" on any failure).
+    Works unprivileged for members of the `bluetooth` group."""
+    proc = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "bluetoothctl", *args,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        return out.decode("utf-8", errors="ignore")
+    except Exception:
+        if proc is not None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+        return ""
+
+
+async def _drop_stale_link():
+    """Drop an ACL link BlueZ still holds to the known strap.
 
     A connected BLE peripheral stops advertising, so after a server
     restart/crash that left the link open, every scan would miss the strap
-    until its supervision timeout expired. Kicking the link first restores
-    advertising."""
+    until its supervision timeout expired. The previous version called
+    BleakClient(mac).disconnect() on a never-connected client, which bleak
+    treats as a no-op (while still logging STALE_LINK_DROP); go through BlueZ
+    itself instead, and only when it really reports the link up."""
     if not KNOWN_HR_ADDRESS:
         return
-    try:
-        stale = BleakClient(KNOWN_HR_ADDRESS)
-        await asyncio.wait_for(stale.disconnect(), timeout=5)
-        _log("STALE_LINK_DROP mac=" + KNOWN_HR_ADDRESS)
-    except Exception:
-        pass  # nothing to drop (the common case) — fine
+    info = await _bluetoothctl("info", KNOWN_HR_ADDRESS)
+    if "Connected: yes" not in info:
+        return
+    await _bluetoothctl("disconnect", KNOWN_HR_ADDRESS)
+    _log("STALE_LINK_DROP mac=" + KNOWN_HR_ADDRESS)
+
+
+async def _power_cycle_adapter():
+    """Recover a wedged hci0 (Pi 4 combo chip) without root: BlueZ lets the
+    `bluetooth` group toggle Powered. Clears leaked discovery sessions too."""
+    _log("ADAPTER_POWER_CYCLE")
+    await _bluetoothctl("power", "off")
+    await asyncio.sleep(2)
+    await _bluetoothctl("power", "on")
+    await asyncio.sleep(3)
+
+
+def _is_live_adv(adv_data) -> bool:
+    """True only for a real advertisement. bleak's BlueZ backend fills
+    adv_data.rssi with -127 when the D-Bus object has no RSSI, and re-fires the
+    callback on any Device1 property change (Connected, ServicesResolved...),
+    so a cached-but-silent strap used to look "found" and cost ~90 s of doomed
+    connect attempts. BlueZ only carries RSSI while it is hearing adverts."""
+    pd = getattr(adv_data, "platform_data", None)
+    if isinstance(pd, tuple) and len(pd) >= 2 and isinstance(pd[1], dict):
+        return "RSSI" in pd[1]
+    rssi = getattr(adv_data, "rssi", None)
+    return rssi is not None and rssi > -127
+
+
+# One long listening window instead of 10 s scan / 8 s pause: the strap was
+# missed while the Pi was deaf ~45 % of the time.
+SCAN_WINDOW_S = 30
+SCAN_PAUSE_S = 1
 
 
 async def _scan_for_device(BleakScanner):
     """Scan for the HR strap, returning (device, devices_found).
 
-    Exits as soon as the known MAC is seen with a *live* advertisement (RSSI
-    present, i.e. not a stale BlueZ cache entry) instead of always waiting the
-    full 10s. scanner.stop() runs in a finally so a leaked discovery session
-    can't poison every later scan with InProgress."""
+    Exits as soon as the known MAC is seen with a *live* advertisement instead
+    of always waiting the full window. start() and stop() both sit inside the
+    try/finally so a slow start can't leak a discovery session that would
+    poison every later scan with InProgress."""
     devices_found = {}
     found_event = asyncio.Event()
 
     def detection_callback(device, adv_data):
+        if not _is_live_adv(adv_data):
+            return
         devices_found[device.address] = (device, adv_data)
         if (KNOWN_HR_ADDRESS
-                and device.address.upper() == KNOWN_HR_ADDRESS.upper()
-                and getattr(adv_data, "rssi", None) is not None):
+                and device.address.upper() == KNOWN_HR_ADDRESS.upper()):
             found_event.set()
 
     scanner = BleakScanner(detection_callback=detection_callback)
-    await asyncio.wait_for(scanner.start(), timeout=15)
     try:
+        await asyncio.wait_for(scanner.start(), timeout=15)
         try:
-            await asyncio.wait_for(found_event.wait(), timeout=10)
+            await asyncio.wait_for(found_event.wait(), timeout=SCAN_WINDOW_S)
         except asyncio.TimeoutError:
             pass
     finally:
@@ -165,12 +223,16 @@ async def _stream_from_device(BleakClient, hr_device):
     device (abort-by-local almost always succeeds on attempt 2). The client is
     always disconnected in a finally, which also cancels a pending BlueZ
     Connect() that would otherwise block the next scan."""
-    for attempt in range(3):
-        client = BleakClient(hr_device, timeout=20.0)
+    # 2 attempts, not 3: the device was just heard advertising, so a second
+    # immediate try covers the transient aborts; beyond that we are better
+    # off back in the scan than spending ~90 s on a strap that went quiet.
+    _set_state("connecting")
+    for attempt in range(2):
+        client = BleakClient(hr_device, timeout=15.0)
         try:
-            await asyncio.wait_for(client.connect(), timeout=25)
+            await asyncio.wait_for(client.connect(), timeout=20)
         except Exception as e:
-            if _is_transient(e) and attempt < 2:
+            if _is_transient(e) and attempt < 1:
                 _log("CONNECT_RETRY", attempt=attempt + 1, repr=repr(e))
                 await asyncio.sleep(2 * (attempt + 1))
                 continue
@@ -184,6 +246,7 @@ async def _stream_from_device(BleakClient, hr_device):
 
             with hr_lock:
                 hr_data["connected"] = True
+                hr_data["state"] = "connected"
                 hr_data["device_name"] = hr_device.name or "HRM-Pro+"
             _log("CONNECT_OK", name=(hr_device.name or "?"))
 
@@ -259,20 +322,25 @@ async def _scan_and_connect():
 
     scan_failures = 0
     empty_scans = 0  # consecutive scans that saw *zero* devices → adapter suspect
+    errors = 0       # consecutive exceptions (InProgress, no adapter...)
 
     # Drop any link BlueZ still holds from a previous run before the first scan.
-    await _drop_stale_link(BleakClient)
+    await _drop_stale_link()
 
     while True:
         _hr_cycle += 1
         try:
             with hr_lock:
                 hr_data["connected"] = False
+                if hr_data["state"] != "adapter_error":
+                    hr_data["state"] = "scanning"
 
             _log("SCAN_START known_mac=" + (KNOWN_HR_ADDRESS or "(none)"))
             hr_device, match_via, devices_found = await _scan_for_device(BleakScanner)
             _log("SCAN_END", seen=len(devices_found),
                  matched=("yes" if hr_device else "no"))
+            errors = 0
+            _set_state("scanning")
 
             # Zero devices in a lived-in home usually means the adapter is
             # down (rfkill soft-block, not powered), not "strap absent".
@@ -281,6 +349,9 @@ async def _scan_and_connect():
                 if empty_scans >= 3:
                     _log("ADAPTER_SUSPECT empty_scans=" + str(empty_scans)
                          + " hint=check_rfkill_and_bluetooth_powered")
+                    _set_state("adapter_error")
+                    await _power_cycle_adapter()
+                    empty_scans = 0
             else:
                 empty_scans = 0
 
@@ -300,9 +371,10 @@ async def _scan_and_connect():
                 # A stale BlueZ link can keep the strap from advertising; try
                 # dropping it every few misses so a wedged link self-heals.
                 if scan_failures % 3 == 0:
-                    await _drop_stale_link(BleakClient)
-                _log("NO_MATCH fail_count=" + str(scan_failures) + " sleep=8s")
-                await asyncio.sleep(8)
+                    await _drop_stale_link()
+                _log("NO_MATCH fail_count=" + str(scan_failures)
+                     + f" sleep={SCAN_PAUSE_S}s")
+                await asyncio.sleep(SCAN_PAUSE_S)
                 continue
 
             scan_failures = 0
@@ -313,10 +385,16 @@ async def _scan_and_connect():
 
         except Exception as e:
             import traceback
-            _log("ERROR", type=type(e).__name__, repr=repr(e))
+            errors += 1
+            _log("ERROR", type=type(e).__name__, repr=repr(e), consecutive=errors)
             traceback.print_exc()
-            # No in-process bluetooth restart. If BlueZ is wedged, a process
-            # restart (systemd, After=bluetooth.service) recovers ordering.
+            # Repeated errors (InProgress from a leaked discovery, "No powered
+            # Bluetooth adapters", D-Bus timeouts) never heal by retrying:
+            # power-cycle the adapter, which resets BlueZ's discovery state.
+            if errors >= 3:
+                _set_state("adapter_error")
+                await _power_cycle_adapter()
+                errors = 0
 
         with hr_lock:
             hr_data["connected"] = False
@@ -343,6 +421,7 @@ def _hr_thread():
     finally:
         with hr_lock:
             hr_data["manager_alive"] = False
+            hr_data["state"] = "dead"
             hr_data["connected"] = False
             hr_data["bpm"] = 0
 
@@ -363,6 +442,21 @@ def get_hr():
     """Get current HR data. Thread-safe."""
     with hr_lock:
         return dict(hr_data)
+
+
+def release_hr_link() -> None:
+    """Synchronously drop BlueZ's link to the strap (call on shutdown).
+    BlueZ keeps the ACL link when the process dies, which ate one of the
+    strap's 2-3 BLE slots until its supervision timeout."""
+    if not KNOWN_HR_ADDRESS:
+        return
+    import subprocess
+    try:
+        subprocess.run(["bluetoothctl", "disconnect", KNOWN_HR_ADDRESS],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=3)
+    except Exception:
+        pass
 
 
 # ==================================

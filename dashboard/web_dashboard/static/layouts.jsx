@@ -20,7 +20,6 @@ function StatusBar({ state, data = {} }) {
   const bleOn = data.ble_on;
   const usbColor = data.usb_connected ? TOKENS.green : TOKENS.textFaint;
   const bleColor = bleOn ? (data.ble_connected ? TOKENS.green : TOKENS.amber) : TOKENS.textFaint;
-  const hrColor_ = data.hr_connected ? TOKENS.green : TOKENS.textFaint;
   const runs = data.log_count || 0;
   const usedMb = Math.round(data.logs_size_mb || 0);
   const freeMb = data.disk_free_mb || 0;
@@ -43,7 +42,7 @@ function StatusBar({ state, data = {} }) {
       <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
         <StatusItem label="USB" color={usbColor} />
         <StatusItem label="BLE" color={bleColor} pulse={bleOn && !data.ble_connected} />
-        <StatusItem label="HR" color={hrColor_} />
+        <StatusItem label="HR" {...hrStatusProps(data)} />
         {data.usb_connected && data.tof_ok === false &&
           <StatusItem label="TOF" color={TOKENS.red} pulse />}
         <span style={{
