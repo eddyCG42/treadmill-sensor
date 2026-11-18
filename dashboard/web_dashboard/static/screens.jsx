@@ -4,7 +4,7 @@ const { useState: useStateS } = React;
 
 // ---------- IDLE / START SCREEN ----------
 // Mode is chosen HERE, before starting. Big visual difference between PISTE and RANDOM.
-function IdleScreen({ mode, setMode, onStart, onCalibration, ble, setBle, lastRun, liveSpeed, liveIncline, liveHR,
+function IdleScreen({ mode, setMode, onStart, onCalibration, ble, setBle, lastRun, liveSpeed, liveIncline, liveHR, hrInfo = {},
                      routeCount = 0, routeMinKm = 0, routeMaxKm = 0 }) {
   // Random-pool description built from the live catalogue (GPX dropped into
   // ~/treadmill_routes on the Pi), so it never goes stale as routes change.
@@ -13,7 +13,7 @@ function IdleScreen({ mode, setMode, onStart, onCalibration, ble, setBle, lastRu
     ? `Tiré dans ${routeCount} parcours · ${fmtKm(routeMinKm)}–${fmtKm(routeMaxKm)} km`
     : 'Parcours tiré au hasard · sans répétition';
   const livePace = liveSpeed > 0.3
-    ? `${Math.floor(60/liveSpeed)}:${String(Math.round((60/liveSpeed % 1)*60)).padStart(2,'0')}`
+    ? fmtPace(paceFromSpeed(liveSpeed))
     : '--:--';
   const hrOk = liveHR > 0;
   const speedOk = liveSpeed > 0.1;
@@ -81,7 +81,8 @@ function IdleScreen({ mode, setMode, onStart, onCalibration, ble, setBle, lastRu
           </div>
           <div style={{ textAlign: 'right' }}>
             <div style={{ fontSize: 10, color: TOKENS.textFaint, letterSpacing: 1, fontWeight: 700, display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 4 }}>
-              <Dot color={hrOk ? TOKENS.green : TOKENS.red} pulse={hrOk} /> HR
+              <Dot color={hrOk ? TOKENS.green : (hrInfo.color || TOKENS.red)} pulse={hrOk || !!hrInfo.pulse} /> HR
+              {hrInfo.text && <span style={{ color: hrOk ? TOKENS.textDim : (hrInfo.color || TOKENS.red), letterSpacing: 0.5 }}>· {hrInfo.text}</span>}
             </div>
             <div style={{ fontSize: 22, fontWeight: 800, color: hrOk ? TOKENS.hr : TOKENS.textFaint, fontVariantNumeric: 'tabular-nums' }}>
               {hrOk ? liveHR : '--'}<span style={{ fontSize: 11, color: TOKENS.textDim, fontWeight: 600, marginLeft: 3 }}>bpm</span>
@@ -169,7 +170,7 @@ function RunHeader({ state, mode, paceMult, onPause, onResume, onStop }) {
         <ModeBadge mode={mode} compact />
         {state === 'PAUSED' && (
           <span style={{ fontSize: 12, fontWeight: 800, color: TOKENS.amber, letterSpacing: 1, whiteSpace: 'nowrap' }}>
-            ⏸ AUTO-PAUSE
+            ⏸ PAUSE
           </span>
         )}
         {state === 'RUNNING' && (
@@ -384,7 +385,7 @@ function CalibrationPage({
               <div style={{ textAlign: 'right' }}>
                 <div style={{ fontSize: 10, color: TOKENS.textFaint, letterSpacing: 1.5, fontWeight: 700 }}>LIVE BRUT</div>
                 <div style={{ fontSize: 24, fontWeight: 800, color: TOKENS.incline, fontVariantNumeric: 'tabular-nums', lineHeight: 1 }}>
-                  {liveIncline >= 0 ? '+' : ''}{liveIncline.toFixed(2)}<span style={{ fontSize: 12, color: TOKENS.textDim, marginLeft: 2 }}>%</span>
+                  {liveIncline.toFixed(1)}<span style={{ fontSize: 12, color: TOKENS.textDim, marginLeft: 2 }}>mm</span>
                 </div>
               </div>
             </div>
@@ -410,10 +411,7 @@ function CalibrationPage({
                     <div style={{ flex: 1, minWidth: 0 }}>
                       {has ? (
                         <span style={{ fontSize: 15, fontWeight: 800, color: TOKENS.green, fontVariantNumeric: 'tabular-nums' }}>
-                          brut {captured >= 0 ? '+' : ''}{captured.toFixed(2)}%
-                          <span style={{ fontSize: 10, color: TOKENS.textFaint, fontWeight: 600, marginLeft: 8 }}>
-                            écart {drift >= 0 ? '+' : ''}{drift.toFixed(2)}
-                          </span>
+                          brut {captured.toFixed(1)} mm
                         </span>
                       ) : (
                         <span style={{ fontSize: 12, color: TOKENS.textFaint, fontStyle: 'italic' }}>

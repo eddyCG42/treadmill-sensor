@@ -31,6 +31,21 @@
 //
 // Hardware unchanged: Adafruit Bluefruit nRF52840 + VL53L4CD (Pololu lib) +
 // LSM303 accel + DRV5023 Hall. Wire format extended (see sendSerialData).
+//
+// v12.2 — robustness (fixes the ~52 s dropout / frozen-pulses incidents):
+//   - Serial OUTPUT never blocks. The core's USB-CDC write() spins forever
+//     while the host holds the port open but stops reading, which froze the
+//     whole loop (speed, BLE to the watch, command handling). Every line now
+//     goes through `Out`, a line-atomic software queue drained by txPump()
+//     only as fast as the USB FIFO has room; when the queue is full, whole
+//     lines are dropped and counted (TXDROP in STATUS/DIAG).
+//   - Hardware watchdog (nRF52 WDT, 8 s). If loop() ever stops turning (I2C
+//     bus hang, anything else) the chip resets itself; the Pi re-syncs config
+//     on the `$HELLO`. The boot banner reports the reset reason so a watchdog
+//     reset shows up in the Pi journal.
+//   - BLE connect/disconnect events are flagged in the BLE callback task and
+//     printed from loop(), so only one task ever touches the serial queue.
+//   No wire-format change: a v12.1 Pi works with this firmware unchanged.
 // ---------------------------------------------------------------------------
 
 #include <bluefruit.h>
@@ -39,12 +54,14 @@
 #include <Adafruit_Sensor.h>
 #include <VL53L4CD.h>                  // Pololu VL53L4CD
 
-#define FW_VERSION "v12.1"
+#define FW_VERSION "v12.2"
+#define WDT_TIMEOUT_S     8         // loop() must turn at least this often
 
 // ---- FIXED CONFIG (compile-time; not worth a runtime knob) ----
 #define HALL_PIN          A0
 #define TOF_READ_MS       100
 #define ACCEL_READ_MS     10        // 100 Hz, matches LSM303DLHC default ODR
+#define TOF_FAST_CONFIRM  3         // consecutive same-side samples (0.3 s)
 #define TOF_CAL_TARGET_HI 12        // fallback calibration upper target (%)
 // VL53L4CD timing budget (ms): 10..200. 50ms = good speed/accuracy compromise.
 // Inter-measurement must be >= timing budget; 100 ms = 10 Hz. Changing these
@@ -57,11 +74,94 @@
 #define TOF_CAL_MAX_MM    2000
 // How long a Pi-pushed BLE incline stays "fresh" before we fall back to the
 // firmware's own mm->% mapping.
-#define PI_INCLIN_TIMEOUT 2000
+#define PI_INCLIN_TIMEOUT 5000
 #define PI_CADENCE_TIMEOUT 3000   // Pi's BLE_CAD push considered fresh for this long
 
 static inline float clampf(float v, float lo, float hi) {
   return v < lo ? lo : (v > hi ? hi : v);
+}
+
+// ==============================
+// Non-blocking serial output
+// ==============================
+// All output goes through `Out` (a Print, so print()/println() formatting is
+// unchanged). Characters are staged until '\n', then the whole line is moved
+// into a ring buffer if it fits, otherwise dropped and counted — a line is
+// never sent half. txPump() (called every loop) hands the USB FIFO only as many
+// bytes as it can take right now, so nothing here can ever block.
+// Single-task only: call from setup()/loop(), never from a BLE callback.
+#define TXQ_SIZE   2048             // > a full CFG_DUMP burst (~500 B)
+#define TXQ_LINE   256              // longest single line (STATUS ~150 B)
+
+class TxQueue : public Print {
+ public:
+  using Print::write;
+  size_t write(uint8_t c) override {
+    if (_lineLen < TXQ_LINE) _line[_lineLen++] = c;
+    else _lineOverflow = true;
+    if (c == '\n') commit();
+    return 1;
+  }
+  // Move queued bytes to USB without blocking.
+  void pump() {
+    if (!Serial) {              // no host listening: don't hoard stale lines
+      _count = 0; _tail = _head;
+      return;
+    }
+    while (_count > 0) {
+      int room = Serial.availableForWrite();
+      if (room <= 0) return;
+      uint16_t n = _count;
+      if (n > (uint16_t)room) n = (uint16_t)room;
+      if (n > TXQ_SIZE - _tail) n = TXQ_SIZE - _tail;   // contiguous chunk
+      size_t sent = Serial.write(_ring + _tail, n);     // fits => returns at once
+      if (sent == 0) return;
+      _tail = (_tail + sent) % TXQ_SIZE;
+      _count -= sent;
+    }
+  }
+  uint32_t dropped() const { return _dropped; }
+  uint16_t freeBytes() const { return TXQ_SIZE - _count; }
+
+ private:
+  void commit() {
+    if (_lineOverflow || _lineLen > TXQ_SIZE - _count) {
+      _dropped++;
+    } else {
+      for (uint16_t i = 0; i < _lineLen; i++) {
+        _ring[_head] = _line[i];
+        _head = (_head + 1) % TXQ_SIZE;
+      }
+      _count += _lineLen;
+    }
+    _lineLen = 0;
+    _lineOverflow = false;
+  }
+  uint8_t  _ring[TXQ_SIZE];
+  uint8_t  _line[TXQ_LINE];
+  uint16_t _head = 0, _tail = 0, _count = 0, _lineLen = 0;
+  bool     _lineOverflow = false;
+  uint32_t _dropped = 0;
+};
+TxQueue Out;
+
+// ==============================
+// Hardware watchdog (nRF52 WDT)
+// ==============================
+// Once started it cannot be stopped and it keeps counting through a soft reset.
+// Keeps running while the CPU sleeps (a blocked loop sleeps), pauses under a
+// debugger. If it was already started before a soft reset, the config writes
+// are ignored by the hardware and we just keep feeding it.
+static inline void wdtFeed() {
+  NRF_WDT->RR[0] = WDT_RR_RR_Reload;
+}
+void wdtStart() {
+  NRF_WDT->CONFIG = (WDT_CONFIG_SLEEP_Run << WDT_CONFIG_SLEEP_Pos) |
+                    (WDT_CONFIG_HALT_Pause << WDT_CONFIG_HALT_Pos);
+  NRF_WDT->CRV = (uint32_t)WDT_TIMEOUT_S * 32768UL - 1;
+  NRF_WDT->RREN = WDT_RREN_RR0_Msk;
+  NRF_WDT->TASKS_START = 1;
+  wdtFeed();
 }
 
 // ---- RUNTIME CONFIG (settable via `SET <key> <value>`) ----
@@ -74,7 +174,16 @@ uint16_t bleUpdateMs     = 500;
 uint16_t serialUpdateMs  = 500;
 uint16_t speedTimeoutMs  = 3000;
 float    speedEma        = 0.25;   // speed smoothing weight on the new sample
-float    tofEma          = 0.10;   // ToF smoothing weight on the new median
+float    tofEma          = 0.10;   // ToF smoothing weight on the new median (steady)
+// Incline response (v12.2). A footfall shakes the deck for a fraction of a
+// second and swings back; the incline motor moves ~10 mm per % and keeps going
+// the same way. So: a SHORT median removes the impact spikes, and the EMA runs
+// slow (tofEma) while the median stays within tofFastMm of the smoothed value,
+// but switches to tofEmaFast once it has been off by more than that, on the
+// same side, for TOF_FAST_CONFIRM samples in a row (a real move).
+uint8_t  tofMedN         = 9;      // median window, samples @10 Hz (odd, 1..21)
+float    tofEmaFast      = 0.50;   // EMA weight while a real move is confirmed
+float    tofFastMm       = 3.0;    // deviation (mm) that counts as a move (~0.3 %)
 float    accelBaseEma    = 0.02;   // accel baseline tracking weight
 float    cadThreshold    = 2.0;    // m/s^2 impact deviation that counts as a step
 float    cadRearm        = 1.0;    // must drop below this to re-arm (hysteresis)
@@ -159,6 +268,11 @@ unsigned long lastAccelRead = 0;
 bool rawStreamOn = false;
 unsigned long rawStreamStart = 0;
 
+// Why we last (re)booted (nRF RESETREAS; bit 1 = watchdog). Also reported in
+// STATUS, which the Pi asks for on every connect — the boot banner itself is
+// usually gone before the Pi has reopened the port.
+uint32_t resetReason = 0;
+
 // ---- BLE STATE ----
 bool bleActive = true;
 
@@ -187,9 +301,10 @@ void hallISR() {
 // Speed
 // ==============================
 void updateSpeed() {
-  unsigned long now = millis();
-
+  // millis() is read INSIDE the critical section: read before it, a pulse
+  // landing in between made (now - lastPulse) underflow and zeroed the speed.
   noInterrupts();
+  unsigned long now = millis();
   unsigned long lastPulse = lastPulseTime;
   unsigned long interval = pulseInterval;
   bool gotPulse = newPulse;
@@ -261,8 +376,10 @@ void updateCadence() {
                        (int)(ev.acceleration.y * 1000.0f),
                        (int)(ev.acceleration.z * 1000.0f),
                        (int)(smoothSpeedMs * 1000.0f));
-      if (n > 0 && Serial.availableForWrite() >= n) {
-        Serial.write((const uint8_t*)buf, n);
+      // Only while the queue is under half full: when the host reads slowly
+      // the 100 Hz stream must not crowd out $DATA and config acks.
+      if (n > 0 && n < (int)sizeof(buf) && Out.freeBytes() > TXQ_SIZE / 2) {
+        Out.write((const uint8_t*)buf, n);   // dropped whole if the queue is full
       }
     }
   }
@@ -358,7 +475,7 @@ void readTOF() {
   tofRawMm = sensor.ranging_data.range_mm;
   lastTofGood = millis();
 
-  // Median filter (21 samples = ~2.1s at 100ms read rate).
+  // Median over the most recent tofMedN samples (100 ms each).
   static uint16_t medBuf[21] = {0};
   static uint8_t medIdx = 0;
   static uint8_t medCount = 0;
@@ -367,8 +484,9 @@ void readTOF() {
   if (medCount < 21) medCount++;
 
   uint16_t sorted[21];
-  int n = medCount;
-  for (int i = 0; i < n; i++) sorted[i] = medBuf[i];
+  int n = tofMedN;
+  if (n > medCount) n = medCount;
+  for (int i = 0; i < n; i++) sorted[i] = medBuf[(medIdx + 21 - 1 - i) % 21];
   for (int i = 0; i < n - 1; i++)
     for (int j = i + 1; j < n; j++)
       if (sorted[j] < sorted[i]) { uint16_t t = sorted[i]; sorted[i] = sorted[j]; sorted[j] = t; }
@@ -378,7 +496,16 @@ void readTOF() {
     tofSmoothMm = median;
     tofSmoothSeeded = true;
   } else {
-    tofSmoothMm = tofEma * median + (1.0f - tofEma) * tofSmoothMm;
+    // Slow while steady, fast once a sustained one-sided deviation shows the
+    // deck is really moving (see the tofMedN comment).
+    static int8_t devRun = 0;
+    float dev = median - tofSmoothMm;
+    if (dev > tofFastMm)       devRun = (devRun > 0) ? (devRun < 100 ? devRun + 1 : 100) : 1;
+    else if (dev < -tofFastMm) devRun = (devRun < 0) ? (devRun > -100 ? devRun - 1 : -100) : -1;
+    else                       devRun = 0;
+    bool moving = (devRun >= TOF_FAST_CONFIRM) || (devRun <= -TOF_FAST_CONFIRM);
+    float a = moving ? tofEmaFast : tofEma;
+    tofSmoothMm = a * median + (1.0f - a) * tofSmoothMm;
   }
 
   tofPercent = mmToPercent(tofSmoothMm);
@@ -438,13 +565,34 @@ void startAdvertising() {
   Bluefruit.Advertising.start(0);
 }
 
+// These run in the Bluefruit callback task: only raise a flag, loop() prints it
+// (the serial queue is single-task).
+volatile bool bleEvtConnected = false;
+volatile bool bleEvtDisconnected = false;
+volatile bool bleAdvRestart = false;
+
 void bleConnectCallback(uint16_t conn_handle) {
-  Serial.println("[BLE_EVENT] CONNECTED");
+  bleEvtConnected = true;
 }
 
 void bleDisconnectCallback(uint16_t conn_handle, uint8_t reason) {
-  Serial.println("[BLE_EVENT] DISCONNECTED");
-  if (bleActive) startAdvertising();
+  bleEvtDisconnected = true;
+  bleAdvRestart = true;   // done from loop(): it also drives Advertising
+}
+
+void reportBleEvents() {
+  if (bleAdvRestart) {
+    bleAdvRestart = false;
+    if (bleActive && !Bluefruit.connected()) startAdvertising();
+  }
+  if (bleEvtConnected) {
+    bleEvtConnected = false;
+    Out.println("[BLE_EVENT] CONNECTED");
+  }
+  if (bleEvtDisconnected) {
+    bleEvtDisconnected = false;
+    Out.println("[BLE_EVENT] DISCONNECTED");
+  }
 }
 
 void sendRscData() {
@@ -485,7 +633,7 @@ void enableBLE() {
   if (!bleActive) {
     bleActive = true;
     startAdvertising();
-    Serial.println("[BLE_EVENT] BLE_ON");
+    Out.println("[BLE_EVENT] BLE_ON");
   }
 }
 
@@ -496,7 +644,7 @@ void disableBLE() {
       Bluefruit.disconnect(Bluefruit.connHandle());
     }
     Bluefruit.Advertising.stop();
-    Serial.println("[BLE_EVENT] BLE_OFF");
+    Out.println("[BLE_EVENT] BLE_OFF");
   }
 }
 
@@ -510,7 +658,8 @@ const char* PARAM_KEYS[] = {
   "pace_factor", "inclin_offset", "cad_threshold", "cad_rearm",
   "cad_refract_ms", "cad_timeout_ms", "wheel_diam_mm", "debounce_ms",
   "speed_timeout_ms", "ble_update_ms", "serial_update_ms",
-  "speed_ema", "tof_ema", "accel_base_ema", "tof_cal_0_mm", "tof_cal_12_mm"
+  "speed_ema", "tof_ema", "accel_base_ema", "tof_cal_0_mm", "tof_cal_12_mm",
+  "tof_med_n", "tof_ema_fast", "tof_fast_mm"
 };
 const int PARAM_COUNT = sizeof(PARAM_KEYS) / sizeof(PARAM_KEYS[0]);
 
@@ -531,6 +680,9 @@ float getParam(const String& k) {
   if (k == "accel_base_ema")   return accelBaseEma;
   if (k == "tof_cal_0_mm")     return tofCal0Mm;
   if (k == "tof_cal_12_mm")    return tofCal12Mm;
+  if (k == "tof_med_n")        return tofMedN;
+  if (k == "tof_ema_fast")     return tofEmaFast;
+  if (k == "tof_fast_mm")      return tofFastMm;
   return 0.0f;   // unknown key (callers gate on isKnownParam first)
 }
 
@@ -548,8 +700,8 @@ bool applyParam(const String& k, float v) {
   }
   else if (k == "debounce_ms")      debounceMs = (uint16_t)v;
   else if (k == "speed_timeout_ms") speedTimeoutMs = (uint16_t)v;
-  else if (k == "ble_update_ms")    bleUpdateMs = (uint16_t)v;
-  else if (k == "serial_update_ms") serialUpdateMs = (uint16_t)v;
+  else if (k == "ble_update_ms")    bleUpdateMs = (uint16_t)clampf(v, 50.0f, 5000.0f);
+  else if (k == "serial_update_ms") serialUpdateMs = (uint16_t)clampf(v, 50.0f, 5000.0f);
   else if (k == "speed_ema")        speedEma = clampf(v, 0.01f, 1.0f);
   else if (k == "tof_ema")          tofEma = clampf(v, 0.01f, 1.0f);
   else if (k == "accel_base_ema")   accelBaseEma = clampf(v, 0.001f, 1.0f);
@@ -561,6 +713,12 @@ bool applyParam(const String& k, float v) {
     if (v < TOF_CAL_MIN_MM || v > TOF_CAL_MAX_MM) return false;
     tofCal12Mm = (int16_t)v;
   }
+  else if (k == "tof_med_n") {
+    uint8_t n = (uint8_t)clampf(v, 1.0f, 21.0f);
+    tofMedN = n | 1;                              // keep it odd
+  }
+  else if (k == "tof_ema_fast")     tofEmaFast = clampf(v, 0.01f, 1.0f);
+  else if (k == "tof_fast_mm")      tofFastMm = clampf(v, 0.5f, 500.0f);
   else return false;
   return true;
 }
@@ -573,8 +731,8 @@ bool isKnownParam(const String& k) {
 }
 
 void printParam(const String& k) {
-  Serial.print("[CONFIG] "); Serial.print(k); Serial.print("=");
-  Serial.println(getParam(k), 3);
+  Out.print("[CONFIG] "); Out.print(k); Out.print("=");
+  Out.println(getParam(k), 3);
 }
 
 // ==============================
@@ -587,21 +745,21 @@ void handleCommand(String cmd) {
   // ---- generic runtime config ----
   if (cmd.startsWith("SET ")) {
     int sp = cmd.indexOf(' ', 4);
-    if (sp < 0) { Serial.println("[CONFIG] bad SET (need: SET key value)"); return; }
+    if (sp < 0) { Out.println("[CONFIG] bad SET (need: SET key value)"); return; }
     String key = cmd.substring(4, sp);
     String val = cmd.substring(sp + 1);
     key.trim(); val.trim();
     if (applyParam(key, val.toFloat())) printParam(key);
-    else { Serial.print("[CONFIG] rejected "); Serial.println(key); }
+    else { Out.print("[CONFIG] rejected "); Out.println(key); }
   }
   else if (cmd.startsWith("GET ")) {
     String key = cmd.substring(4); key.trim();
     if (isKnownParam(key)) printParam(key);
-    else { Serial.print("[CONFIG] unknown "); Serial.println(key); }
+    else { Out.print("[CONFIG] unknown "); Out.println(key); }
   }
   else if (cmd == "CFG_DUMP") {
     for (int i = 0; i < PARAM_COUNT; i++) printParam(String(PARAM_KEYS[i]));
-    Serial.println("[CONFIG] END");
+    Out.println("[CONFIG] END");
   }
   // ---- incline pushed from the Pi (high rate, no echo) ----
   else if (cmd.startsWith("BLE_INCLIN:")) {
@@ -621,62 +779,64 @@ void handleCommand(String cmd) {
     pulseCountBase = pulseCount;
     interrupts();
     distanceM = 0.0;
-    Serial.println("[CONFIG] distance reset");
+    Out.println("[CONFIG] distance reset");
   }
   else if (cmd == "TOF_CAL_CLEAR") {
     tofCal0Mm = -1;
     tofCal12Mm = -1;
-    Serial.println("[CONFIG] tof_cal cleared");
+    Out.println("[CONFIG] tof_cal cleared");
   }
   else if (cmd.startsWith("CAD_RAW:")) {
     rawStreamOn = (cmd.substring(8).toInt() != 0);
     if (rawStreamOn) rawStreamStart = millis();
-    Serial.print("[CONFIG] cad_raw="); Serial.println(rawStreamOn ? 1 : 0);
+    Out.print("[CONFIG] cad_raw="); Out.println(rawStreamOn ? 1 : 0);
   }
   // ---- dumps / diagnostics ----
   else if (cmd == "STATUS") {
-    Serial.print("[STATUS] FW:"); Serial.print(FW_VERSION);
-    Serial.print(",BLE:"); Serial.print(bleActive ? "ON" : "OFF");
-    Serial.print(",CONN:"); Serial.print(Bluefruit.connected() ? "YES" : "NO");
-    Serial.print(",PF:"); Serial.print(paceFactor, 3);
-    Serial.print(",IO:"); Serial.print(inclinOffset, 2);
-    Serial.print(",TOF:"); Serial.print(tofOk ? "OK" : "FAIL");
-    Serial.print(",CAL0:"); Serial.print(tofCal0Mm);
-    Serial.print(",CAL12:"); Serial.print(tofCal12Mm);
-    Serial.print(",IMU:"); Serial.print(imuOk ? "OK" : "FAIL");
+    Out.print("[STATUS] FW:"); Out.print(FW_VERSION);
+    Out.print(",BLE:"); Out.print(bleActive ? "ON" : "OFF");
+    Out.print(",CONN:"); Out.print(Bluefruit.connected() ? "YES" : "NO");
+    Out.print(",PF:"); Out.print(paceFactor, 3);
+    Out.print(",IO:"); Out.print(inclinOffset, 2);
+    Out.print(",TOF:"); Out.print(tofOk ? "OK" : "FAIL");
+    Out.print(",CAL0:"); Out.print(tofCal0Mm);
+    Out.print(",CAL12:"); Out.print(tofCal12Mm);
+    Out.print(",IMU:"); Out.print(imuOk ? "OK" : "FAIL");
     bool piCadFresh = piCadenceLastMs != 0 &&
                       (millis() - piCadenceLastMs) < PI_CADENCE_TIMEOUT;
-    Serial.print(",CADSRC:"); Serial.print(piCadFresh ? "PI" : "LOCAL");
-    Serial.print(",CAD:"); Serial.print(broadcastCadenceSpm());
-    Serial.print(",LOOP_MAX:"); Serial.print(maxLoopTime);
-    Serial.println("ms");
+    Out.print(",CADSRC:"); Out.print(piCadFresh ? "PI" : "LOCAL");
+    Out.print(",CAD:"); Out.print(broadcastCadenceSpm());
+    Out.print(",LOOP_MAX:"); Out.print(maxLoopTime);
+    Out.print("ms,TXDROP:"); Out.print(Out.dropped());
+    Out.print(",RST:0x"); Out.println(resetReason, HEX);
   }
   else if (cmd == "DIAG") {
-    Serial.print("[DIAG] max_loop="); Serial.print(maxLoopTime);
-    Serial.print("ms, loops="); Serial.println(loopCount);
+    Out.print("[DIAG] max_loop="); Out.print(maxLoopTime);
+    Out.print("ms, loops="); Out.print(loopCount);
+    Out.print(", tx_dropped="); Out.println(Out.dropped());
     maxLoopTime = 0;
     loopCount = 0;
   }
   else if (cmd == "TOF") {
-    Serial.print("[TOF] raw_mm="); Serial.print(tofRawMm);
-    Serial.print(" smooth_mm="); Serial.print(tofSmoothMm, 1);
-    Serial.print(" status="); Serial.print(tofStatus);
-    Serial.print(" cal0="); Serial.print(tofCal0Mm);
-    Serial.print(" cal12="); Serial.print(tofCal12Mm);
-    Serial.print(" percent="); Serial.println(tofPercent, 2);
+    Out.print("[TOF] raw_mm="); Out.print(tofRawMm);
+    Out.print(" smooth_mm="); Out.print(tofSmoothMm, 1);
+    Out.print(" status="); Out.print(tofStatus);
+    Out.print(" cal0="); Out.print(tofCal0Mm);
+    Out.print(" cal12="); Out.print(tofCal12Mm);
+    Out.print(" percent="); Out.println(tofPercent, 2);
   }
   else if (cmd == "CAD") {
-    Serial.print("[CAD] dyn="); Serial.print(accelDynamic, 2);
-    Serial.print(" base="); Serial.print(accelBaseline, 2);
-    Serial.print(" thr="); Serial.print(cadThreshold, 2);
-    Serial.print(" rearm="); Serial.print(cadRearm, 2);
-    Serial.print(" refract="); Serial.print(cadRefractMs);
-    Serial.print(" spm="); Serial.print(stepCadenceSpm, 0);
-    Serial.print(" steps="); Serial.print(stepCount);
-    Serial.print(" imu="); Serial.println(imuOk ? "OK" : "FAIL");
+    Out.print("[CAD] dyn="); Out.print(accelDynamic, 2);
+    Out.print(" base="); Out.print(accelBaseline, 2);
+    Out.print(" thr="); Out.print(cadThreshold, 2);
+    Out.print(" rearm="); Out.print(cadRearm, 2);
+    Out.print(" refract="); Out.print(cadRefractMs);
+    Out.print(" spm="); Out.print(stepCadenceSpm, 0);
+    Out.print(" steps="); Out.print(stepCount);
+    Out.print(" imu="); Out.println(imuOk ? "OK" : "FAIL");
   }
   else {
-    Serial.print("[CONFIG] unknown command: "); Serial.println(cmd);
+    Out.print("[CONFIG] unknown command: "); Out.println(cmd);
   }
 }
 
@@ -713,23 +873,23 @@ void sendSerialData() {
   // once in setup() and never cleared).
   bool tofFresh = tofOk && (millis() - lastTofGood < 5000);
 
-  Serial.print("$DATA,");
-  Serial.print(speedKmhRaw, 2);     Serial.print(",");
-  Serial.print(smoothSpeedMs, 4);   Serial.print(",");
-  Serial.print(cadence);            Serial.print(",");
-  Serial.print(distanceM, 2);       Serial.print(",");
-  Serial.print(tofSmoothMm, 1);     Serial.print(",");
-  Serial.print(pulseCount - pulseCountBase); Serial.print(",");
-  Serial.print(bleActive ? 1 : 0);  Serial.print(",");
-  Serial.print(Bluefruit.connected() ? 1 : 0); Serial.print(",");
-  Serial.print(tofRawMm);           Serial.print(",");
-  Serial.print(tofFresh ? 1 : 0);   Serial.print(",");
+  Out.print("$DATA,");
+  Out.print(speedKmhRaw, 2);     Out.print(",");
+  Out.print(smoothSpeedMs, 4);   Out.print(",");
+  Out.print(cadence);            Out.print(",");
+  Out.print(distanceM, 2);       Out.print(",");
+  Out.print(tofSmoothMm, 1);     Out.print(",");
+  Out.print(pulseCount - pulseCountBase); Out.print(",");
+  Out.print(bleActive ? 1 : 0);  Out.print(",");
+  Out.print(Bluefruit.connected() ? 1 : 0); Out.print(",");
+  Out.print(tofRawMm);           Out.print(",");
+  Out.print(tofFresh ? 1 : 0);   Out.print(",");
   // Cadence-tuning telemetry: [11]=impact peak, [12]=step count, [13]=IMU
   // health, [14]=real measured cadence (before fallback).
-  Serial.print(accelDynPeak, 2);    Serial.print(",");
-  Serial.print(stepCount);          Serial.print(",");
-  Serial.print(imuOk ? 1 : 0);      Serial.print(",");
-  Serial.println(realCadenceSpm());
+  Out.print(accelDynPeak, 2);    Out.print(",");
+  Out.print(stepCount);          Out.print(",");
+  Out.print(imuOk ? 1 : 0);      Out.print(",");
+  Out.println(realCadenceSpm());
   accelDynPeak = 0.0;   // reset the peak-hold window
 }
 
@@ -737,16 +897,25 @@ void sendSerialData() {
 // SETUP
 // ==============================
 void setup() {
+  // Why did we (re)boot? Captured by the core at startup. Bit 1 = watchdog.
+  resetReason = readResetReason();
+
+  // Armed before the sensor inits so a wedged I2C bus at boot also recovers.
+  wdtStart();
+
   Serial.begin(115200);
   delay(2000);
+  wdtFeed();
 
-  Serial.print("$HELLO,"); Serial.println(FW_VERSION);
-  Serial.print("[BOOT] Treadmill Sensor "); Serial.print(FW_VERSION);
-  Serial.println(" (VL53L4CD Pololu)");
+  Out.print("$HELLO,"); Out.println(FW_VERSION);
+  Out.print("[BOOT] Treadmill Sensor "); Out.print(FW_VERSION);
+  Out.println(" (VL53L4CD Pololu)");
+  Out.print("[BOOT] reset_reason=0x"); Out.print(resetReason, HEX);
+  Out.println((resetReason & POWER_RESETREAS_DOG_Msk) ? " WATCHDOG" : "");
 
   pinMode(HALL_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(HALL_PIN), hallISR, FALLING);
-  Serial.println("[OK] DRV5023");
+  Out.println("[OK] DRV5023");
 
   Wire.begin();
   Wire.setClock(400000);   // 400 kHz I2C
@@ -755,35 +924,36 @@ void setup() {
   Wire.beginTransmission(0x19);
   uint8_t i2cErr = Wire.endTransmission();
   if (i2cErr != 0) {
-    Serial.print("[WARN] LSM303 not on I2C (err=");
-    Serial.print(i2cErr);
-    Serial.println(") - wiring may have changed");
+    Out.print("[WARN] LSM303 not on I2C (err=");
+    Out.print(i2cErr);
+    Out.println(") - wiring may have changed");
   } else if (!accel.begin()) {
-    Serial.println("[WARN] LSM303 begin failed");
+    Out.println("[WARN] LSM303 begin failed");
   } else {
     accel.setRange(LSM303_RANGE_2G);
     accel.setMode(LSM303_MODE_NORMAL);
     imuOk = true;
-    Serial.println("[OK] LSM303");
+    Out.println("[OK] LSM303");
   }
 
   // VL53L4CD time-of-flight — Pololu API.
   sensor.setTimeout(TOF_I2C_TIMEOUT);
   if (!sensor.init()) {
-    Serial.println("[ERR] VL53L4CD init failed (no I2C ack at 0x29)");
+    Out.println("[ERR] VL53L4CD init failed (no I2C ack at 0x29)");
     tofOk = false;
   } else {
     sensor.setRangeTiming(TOF_TIMING_BUDGET, TOF_INTER_MEAS);
     sensor.startContinuous();
     tofOk = true;
-    Serial.println("[OK] VL53L4CD");
+    Out.println("[OK] VL53L4CD");
   }
 
   setupBLE();
-  Serial.println("[OK] BLE");
+  Out.println("[OK] BLE");
 
   // The Pi waits for this line before pushing config, then verifies each SET.
-  Serial.println("[BOOT] READY");
+  Out.println("[BOOT] READY");
+  wdtFeed();
 }
 
 // ==============================
@@ -793,6 +963,8 @@ void loop() {
   unsigned long loopStart = millis();
   unsigned long now = loopStart;
 
+  wdtFeed();
+  reportBleEvents();
   processSerialInput();
   updateSpeed();
 
@@ -815,6 +987,8 @@ void loop() {
     lastSerial = now;
     sendSerialData();
   }
+
+  Out.pump();   // drain queued lines to USB, as much as fits, never blocking
 
   unsigned long loopTime = millis() - loopStart;
   if (loopTime > maxLoopTime) maxLoopTime = loopTime;

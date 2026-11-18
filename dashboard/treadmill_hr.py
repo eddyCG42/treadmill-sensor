@@ -27,6 +27,70 @@ HR_MEASUREMENT_UUID = "00002a37-0000-1000-8000-00805f9b34fb"
 # Known device MAC (Garmin HRM-Pro Plus) - set to your device
 KNOWN_HR_ADDRESS = "F2:FD:75:D5:48:99"
 
+# Fallback when the known strap is not advertising: any *other* strap that
+# advertises the Heart Rate service (e.g. the COROS arm band). On 2026-11-17
+# the COROS was heard at -47 dBm on every scan and ignored for a whole run
+# because only the known MAC was accepted. Watches broadcasting HR are still
+# excluded by name, so the Fenix cannot hijack the loop.
+WATCH_NAME_KEYWORDS = ("fenix", "forerunner", "venu", "epix", "enduro",
+                       "instinct", "watch", "pace", "apex", "vertix")
+# How long the known strap keeps priority once a fallback strap has been heard.
+FALLBACK_GRACE_S = 8
+
+# Address of the strap we last connected to (known or fallback), so the
+# stale-link cleanup targets the right device.
+_last_hr_address = ""
+
+# A strap that is heard but refuses the link (HCI 0x3e, slots full...) is
+# sidelined for a while after repeated connect failures, so it cannot starve
+# the other strap: addr -> [consecutive_failures, sidelined_until_monotonic].
+CONNECT_FAILS_BEFORE_SIDELINE = 2
+SIDELINE_S = 120
+_connect_fail = {}
+
+
+def _is_sidelined(addr: str) -> bool:
+    rec = _connect_fail.get(addr.upper())
+    return bool(rec) and time.monotonic() < rec[1]
+
+
+# Escalation: a strap that is heard but cannot be connected for this long gets
+# a full restart of the BlueZ daemon (clears its cache and controller state),
+# at most once per BT_RESTART_MIN_GAP_S. The adapter power-cycle alone did not
+# clear the 2026-11-17 failures.
+REFUSED_BEFORE_BT_RESTART_S = 150
+BT_RESTART_MIN_GAP_S = 600
+_refused_since = 0.0    # monotonic time of the first failure since last success
+_last_bt_restart = 0.0
+
+
+def _note_connect_result(addr: str, ok: bool, name: str = "") -> None:
+    global _refused_since
+    addr = addr.upper()
+    with hr_lock:
+        hr_data["detail"] = "" if ok else "refused"
+        hr_data["heard_name"] = "" if ok else (name or addr)
+    if ok:
+        _refused_since = 0.0
+        _connect_fail.pop(addr, None)
+        return
+    if not _refused_since:
+        _refused_since = time.monotonic()
+    rec = _connect_fail.setdefault(addr, [0, 0.0])
+    rec[0] += 1
+    if rec[0] >= CONNECT_FAILS_BEFORE_SIDELINE:
+        rec[0] = 0
+        rec[1] = time.monotonic() + SIDELINE_S
+        _log("SIDELINED", mac=addr, seconds=SIDELINE_S)
+
+
+def _is_fallback_strap(device, adv_data) -> bool:
+    uuids = " ".join(str(u).lower() for u in (adv_data.service_uuids or []))
+    if "180d" not in uuids:
+        return False
+    name = (device.name or getattr(adv_data, "local_name", "") or "").lower()
+    return not any(k in name for k in WATCH_NAME_KEYWORDS)
+
 # Shared state
 hr_data = {
     "bpm": 0,
@@ -39,6 +103,13 @@ hr_data = {
     # What the manager is doing, for the dashboard: starting | scanning |
     # connecting | connected | adapter_error | dead.
     "state": "starting",
+    # Why there is no HR while not connected, for the dashboard chip:
+    #   ""         nothing to report (connected, or still on the first scan)
+    #   "no_strap" the last scan heard no HR strap at all (strap off / asleep)
+    #   "refused"  a strap is on air but the link keeps failing (radio, slots)
+    "detail": "",
+    # Name of the strap heard but not connectable, when detail == "refused".
+    "heard_name": "",
 }
 hr_lock = threading.Lock()
 
@@ -125,13 +196,60 @@ async def _drop_stale_link():
     BleakClient(mac).disconnect() on a never-connected client, which bleak
     treats as a no-op (while still logging STALE_LINK_DROP); go through BlueZ
     itself instead, and only when it really reports the link up."""
+    for mac in dict.fromkeys(m for m in (KNOWN_HR_ADDRESS, _last_hr_address) if m):
+        info = await _bluetoothctl("info", mac)
+        if "Connected: yes" not in info:
+            continue
+        await _bluetoothctl("disconnect", mac)
+        _log("STALE_LINK_DROP mac=" + mac)
+
+
+async def _forget_corrupt_entry():
+    """Remove a corrupted BlueZ record of the known strap.
+
+    Found on 2026-11-17: /var/lib/bluetooth held the HRM-Pro+ with an empty
+    SupportedTechnologies, so BlueZ loaded it at boot as a *public* address
+    device with no services. The strap advertises with a *random* address, and
+    every advert then failed with "Unable to create object for found device"
+    in bluetoothd — bleak never saw the strap although it was on air (this is
+    what made HR discovery fail for weeks). Such a record shows up as
+    "(public)", unpaired, not connected and without any UUID; removing it is
+    harmless, the next advert recreates a correct one."""
     if not KNOWN_HR_ADDRESS:
         return
     info = await _bluetoothctl("info", KNOWN_HR_ADDRESS)
-    if "Connected: yes" not in info:
+    first_line = info.splitlines()[0] if info.strip() else ""
+    if ("(public)" in first_line and "UUID:" not in info
+            and "Connected: yes" not in info and "Paired: yes" not in info):
+        await _bluetoothctl("remove", KNOWN_HR_ADDRESS)
+        _log("CORRUPT_ENTRY_REMOVED mac=" + KNOWN_HR_ADDRESS)
+
+
+async def _restart_bluetooth_if_stuck():
+    """Restart bluetooth.service when straps have been heard-but-refused for
+    REFUSED_BEFORE_BT_RESTART_S. The server runs with NoNewPrivileges, so no
+    sudo: a polkit rule (installed by deploy.sh) lets this user restart that
+    one unit through plain `systemctl`."""
+    global _refused_since, _last_bt_restart
+    now = time.monotonic()
+    if not _refused_since or now - _refused_since < REFUSED_BEFORE_BT_RESTART_S:
         return
-    await _bluetoothctl("disconnect", KNOWN_HR_ADDRESS)
-    _log("STALE_LINK_DROP mac=" + KNOWN_HR_ADDRESS)
+    if _last_bt_restart and now - _last_bt_restart < BT_RESTART_MIN_GAP_S:
+        return
+    _last_bt_restart = now
+    _refused_since = now
+    _log("BT_SERVICE_RESTART reason=strap_heard_but_refused")
+    rc = -1
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "systemctl", "restart", "bluetooth.service",
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+        rc = await asyncio.wait_for(proc.wait(), timeout=25)
+    except Exception as e:
+        _log("BT_SERVICE_RESTART_ERROR", repr=repr(e))
+    _log("BT_SERVICE_RESTART_DONE", rc=rc)
+    _connect_fail.clear()
+    await asyncio.sleep(6)   # let bluetoothd bring hci0 back up
 
 
 async def _power_cycle_adapter():
@@ -172,22 +290,34 @@ async def _scan_for_device(BleakScanner):
     poison every later scan with InProgress."""
     devices_found = {}
     found_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    fallback_seen_t = []  # loop time of the first fallback-strap advert
 
     def detection_callback(device, adv_data):
         if not _is_live_adv(adv_data):
             return
         devices_found[device.address] = (device, adv_data)
+        if _is_sidelined(device.address):
+            return
         if (KNOWN_HR_ADDRESS
                 and device.address.upper() == KNOWN_HR_ADDRESS.upper()):
             found_event.set()
+        elif not fallback_seen_t and _is_fallback_strap(device, adv_data):
+            fallback_seen_t.append(loop.time())
 
     scanner = BleakScanner(detection_callback=detection_callback)
     try:
         await asyncio.wait_for(scanner.start(), timeout=15)
-        try:
-            await asyncio.wait_for(found_event.wait(), timeout=SCAN_WINDOW_S)
-        except asyncio.TimeoutError:
-            pass
+        deadline = loop.time() + SCAN_WINDOW_S
+        grace = (FALLBACK_GRACE_S
+                 if KNOWN_HR_ADDRESS and not _is_sidelined(KNOWN_HR_ADDRESS)
+                 else 0)
+        while not found_event.is_set() and loop.time() < deadline:
+            # A fallback strap is on air: give the known one a short head
+            # start, then stop listening instead of burning the full window.
+            if fallback_seen_t and loop.time() - fallback_seen_t[0] >= grace:
+                break
+            await asyncio.sleep(0.25)
     finally:
         try:
             await asyncio.wait_for(scanner.stop(), timeout=5)
@@ -200,15 +330,22 @@ async def _scan_for_device(BleakScanner):
     # otherwise hijack the loop.
     if KNOWN_HR_ADDRESS:
         for addr, (device, adv_data) in devices_found.items():
-            if addr.upper() == KNOWN_HR_ADDRESS.upper():
+            if (addr.upper() == KNOWN_HR_ADDRESS.upper()
+                    and not _is_sidelined(addr)):
                 hr_device, match_via = device, "known_mac"
                 break
+    if hr_device is None:
+        # Known strap silent (or none configured): strongest strap advertising
+        # the HR service wins. Watches are filtered out by _is_fallback_strap.
+        straps = [(device, adv_data) for device, adv_data in devices_found.values()
+                  if _is_fallback_strap(device, adv_data)
+                  and not _is_sidelined(device.address)]
+        if straps:
+            straps.sort(key=lambda da: getattr(da[1], "rssi", -999) or -999,
+                        reverse=True)
+            hr_device, match_via = straps[0][0], "service_180d"
     if hr_device is None and not KNOWN_HR_ADDRESS:
         for addr, (device, adv_data) in devices_found.items():
-            uuids_str = " ".join(str(u).lower() for u in (adv_data.service_uuids or []))
-            if "180d" in uuids_str:
-                hr_device, match_via = device, "service_180d"
-                break
             name_lower = (device.name or "").lower()
             if any(k in name_lower for k in ["garmin", "fenix", "hrm", "forerunner", "venu"]):
                 hr_device, match_via = device, "name_keyword"
@@ -237,12 +374,15 @@ async def _stream_from_device(BleakClient, hr_device):
                 await asyncio.sleep(2 * (attempt + 1))
                 continue
             _log("CONNECT_FAIL", repr=repr(e))
+            _note_connect_result(hr_device.address, False, hr_device.name or "")
             return
 
         try:
             if not client.is_connected:
                 _log("CONNECT_FAIL is_connected=False")
+                _note_connect_result(hr_device.address, False, hr_device.name or "")
                 return
+            _note_connect_result(hr_device.address, True)
 
             with hr_lock:
                 hr_data["connected"] = True
@@ -299,11 +439,15 @@ async def _stream_from_device(BleakClient, hr_device):
             with hr_lock:
                 hr_data["connected"] = False
                 hr_data["bpm"] = 0
+                # Leave "connected" right away so the dashboard chip doesn't
+                # stay green until the next scan starts.
+                if hr_data.get("state") == "connected":
+                    hr_data["state"] = "scanning"
 
 
 async def _scan_and_connect():
     """Scan for BLE HR device and connect."""
-    global _hr_start_t, _hr_cycle
+    global _hr_start_t, _hr_cycle, _last_hr_address, _refused_since
     _hr_start_t = time.time()
 
     try:
@@ -326,6 +470,7 @@ async def _scan_and_connect():
 
     # Drop any link BlueZ still holds from a previous run before the first scan.
     await _drop_stale_link()
+    await _forget_corrupt_entry()
 
     while True:
         _hr_cycle += 1
@@ -341,6 +486,8 @@ async def _scan_and_connect():
                  matched=("yes" if hr_device else "no"))
             errors = 0
             _set_state("scanning")
+            if match_via != "known_mac":
+                await _forget_corrupt_entry()
 
             # Zero devices in a lived-in home usually means the adapter is
             # down (rfkill soft-block, not powered), not "strap absent".
@@ -374,14 +521,28 @@ async def _scan_and_connect():
                     await _drop_stale_link()
                 _log("NO_MATCH fail_count=" + str(scan_failures)
                      + f" sleep={SCAN_PAUSE_S}s")
+                # Tell "no strap on air" from "strap heard but sidelined".
+                heard = [dev.name or addr
+                         for addr, (dev, adv) in devices_found.items()
+                         if (KNOWN_HR_ADDRESS
+                             and addr.upper() == KNOWN_HR_ADDRESS.upper())
+                         or _is_fallback_strap(dev, adv)]
+                with hr_lock:
+                    hr_data["detail"] = "refused" if heard else "no_strap"
+                    hr_data["heard_name"] = heard[0] if heard else ""
+                if not heard:
+                    _refused_since = 0.0
+                await _restart_bluetooth_if_stuck()
                 await asyncio.sleep(SCAN_PAUSE_S)
                 continue
 
             scan_failures = 0
             _log("FOUND", name=(hr_device.name or "?"),
                  mac=hr_device.address, via=match_via)
+            _last_hr_address = hr_device.address
 
             await _stream_from_device(BleakClient, hr_device)
+            await _restart_bluetooth_if_stuck()
 
         except Exception as e:
             import traceback
@@ -448,15 +609,14 @@ def release_hr_link() -> None:
     """Synchronously drop BlueZ's link to the strap (call on shutdown).
     BlueZ keeps the ACL link when the process dies, which ate one of the
     strap's 2-3 BLE slots until its supervision timeout."""
-    if not KNOWN_HR_ADDRESS:
-        return
     import subprocess
-    try:
-        subprocess.run(["bluetoothctl", "disconnect", KNOWN_HR_ADDRESS],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                       timeout=3)
-    except Exception:
-        pass
+    for mac in dict.fromkeys(m for m in (_last_hr_address, KNOWN_HR_ADDRESS) if m):
+        try:
+            subprocess.run(["bluetoothctl", "disconnect", mac],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=3)
+        except Exception:
+            pass
 
 
 # ==================================

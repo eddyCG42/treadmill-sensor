@@ -41,15 +41,19 @@ const TOKENS = {
   modeRandom: '#a855f7',  // purple for randomized
 };
 
-// HR zones — Karvonen / % Heart-Rate-Reserve for FCmax 198, FCrepos 64
-// (HRR = 134). Upper bounds at 60/70/80/90 % HRR, rounded to nearest:
-//   64 + 0.60*134 = 144.4 -> 144 ; 0.70 -> 157.8 -> 158 ;
-//   0.80 -> 171.2 -> 171 ; 0.90 -> 184.6 -> 185. Z5 tops out at 198.
-// `max` is each zone's UPPER bpm bound; set the Fenix to "% RFC" to match.
+// HR zones — copied from the athlete's Nolio zones for "Course à pied - Tapis"
+// (read 2026-11-16): Z1 <148, Z2 148-162, Z3 162-175, Z4 175-186, Z5 186-198.
+// A zone starts AT its lower bound (148 bpm is Z2), so `max` — each zone's
+// UPPER bpm bound, inclusive — is the next zone's start minus one.
+// To match on the watch, enter the same bpm bounds as custom zones.
+// FCmax 198 (Nolio, set 2026-04-27); FCrepos 56 = 30-day mean of the Garmin
+// resting HR synced to Nolio (range 48-61 over 2026-10-18..11-16).
+const HR_MAX = 198;
+const HR_REST = 56;
 const HR_ZONES = [
-  { max: 144, color: '#3b82f6', label: 'Z1' },
-  { max: 158, color: '#22c55e', label: 'Z2' },
-  { max: 171, color: '#f59e0b', label: 'Z3' },
+  { max: 147, color: '#3b82f6', label: 'Z1' },
+  { max: 161, color: '#22c55e', label: 'Z2' },
+  { max: 174, color: '#f59e0b', label: 'Z3' },
   { max: 185, color: '#ef4444', label: 'Z4' },
   { max: 999, color: '#a855f7', label: 'Z5' },
 ];
@@ -92,4 +96,4 @@ function paceFromSpeed(kmh) {
   return 3600 / kmh;
 }
 
-Object.assign(window, { TOKENS, HR_ZONES, hrColor, hrZone, fmtTime, fmtPace, fmtDist, paceFromSpeed });
+Object.assign(window, { TOKENS, HR_ZONES, HR_MAX, HR_REST, hrColor, hrZone, fmtTime, fmtPace, fmtDist, paceFromSpeed });

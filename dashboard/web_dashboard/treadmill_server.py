@@ -135,10 +135,15 @@ CONFIG_DEFAULTS = {
     "speed_ema": 0.25,
     "tof_ema": 0.10,
     "accel_base_ema": 0.02,
+    # Incline (ToF) response: short median + EMA that is slow while steady and
+    # fast once a real move is confirmed (see the firmware's tofMedN comment).
+    "tof_med_n": 9,
+    "tof_ema_fast": 0.50,
+    "tof_fast_mm": 3.0,
     # Athlete profile (Pi-side): HR strap MAC, HR zone bounds, body mass.
     "hr_mac": "",
     "hr_max": 198,
-    "hr_rest": 64,
+    "hr_rest": 56,
     "body_mass_kg": 70.0,
 }
 
@@ -149,6 +154,7 @@ FEATHER_PARAM_KEYS = (
     "cad_refract_ms", "cad_timeout_ms", "wheel_diam_mm", "debounce_ms",
     "speed_timeout_ms", "ble_update_ms", "serial_update_ms",
     "speed_ema", "tof_ema", "accel_base_ema",
+    "tof_med_n", "tof_ema_fast", "tof_fast_mm",
 )
 
 config_lock = threading.Lock()
@@ -227,15 +233,32 @@ def sanitize_config(raw_cfg: dict[str, Any] | None) -> dict[str, Any]:
             "wheel_diam_mm": round(_clamp(_safe_float(src.get("wheel_diam_mm"), 48.0), 5.0, 500.0), 2),
             "debounce_ms": int(_clamp(_safe_float(src.get("debounce_ms"), 15), 1, 200)),
             "speed_timeout_ms": int(_clamp(_safe_float(src.get("speed_timeout_ms"), 3000), 500, 20000)),
-            "ble_update_ms": int(_clamp(_safe_float(src.get("ble_update_ms"), 500), 100, 5000)),
-            "serial_update_ms": int(_clamp(_safe_float(src.get("serial_update_ms"), 500), 100, 5000)),
+            # Capped at 1 s: the Pi declares the sensor stale after 3 s without
+            # $DATA and reopens the port after 5 s of silence.
+            "ble_update_ms": int(_clamp(_safe_float(src.get("ble_update_ms"), 500), 100, 1000)),
+            "serial_update_ms": int(_clamp(_safe_float(src.get("serial_update_ms"), 500), 100, 1000)),
             "speed_ema": round(_clamp(_safe_float(src.get("speed_ema"), 0.25), 0.01, 1.0), 3),
             "tof_ema": round(_clamp(_safe_float(src.get("tof_ema"), 0.10), 0.01, 1.0), 3),
             "accel_base_ema": round(_clamp(_safe_float(src.get("accel_base_ema"), 0.02), 0.001, 1.0), 3),
+            "tof_med_n": int(_clamp(_safe_float(src.get("tof_med_n"), 9), 1, 21)) | 1,
+            "tof_ema_fast": round(_clamp(_safe_float(src.get("tof_ema_fast"), 0.50), 0.01, 1.0), 3),
+            "tof_fast_mm": round(_clamp(_safe_float(src.get("tof_fast_mm"), 3.0), 0.5, 500.0), 1),
             "hr_mac": str(src.get("hr_mac", "") or "").strip()[:32],
             "hr_max": int(_clamp(_safe_float(src.get("hr_max"), 198), 100, 240)),
-            "hr_rest": int(_clamp(_safe_float(src.get("hr_rest"), 64), 30, 120)),
+            "hr_rest": int(_clamp(_safe_float(src.get("hr_rest"), 56), 30, 120)),
             "body_mass_kg": round(_clamp(_safe_float(src.get("body_mass_kg"), 70.0), 30.0, 200.0), 1),
+            # Pi-side cadence detector tunables: carried through so an edit in
+            # treadmill_config.json actually takes effect and survives a save.
+            "cad_det_enable": bool(src.get("cad_det_enable", True)),
+            "cad_win_s": round(_clamp(_safe_float(src.get("cad_win_s"), 4.0), 1.0, 10.0), 2),
+            "cad_hop_s": round(_clamp(_safe_float(src.get("cad_hop_s"), 0.25), 0.05, 2.0), 2),
+            "cad_band_lo_hz": round(_clamp(_safe_float(src.get("cad_band_lo_hz"), 0.7), 0.2, 3.0), 2),
+            "cad_band_hi_hz": round(_clamp(_safe_float(src.get("cad_band_hi_hz"), 4.5), 2.0, 10.0), 2),
+            "cad_conf_min": round(_clamp(_safe_float(src.get("cad_conf_min"), 0.18), 0.0, 1.0), 3),
+            "cad_sl_min_m": round(_clamp(_safe_float(src.get("cad_sl_min_m"), 0.35), 0.1, 2.0), 2),
+            "cad_sl_max_m": round(_clamp(_safe_float(src.get("cad_sl_max_m"), 2.8), 1.0, 5.0), 2),
+            "cad_hold_ms": int(_clamp(_safe_float(src.get("cad_hold_ms"), 2500), 0, 20000)),
+            "cad_smooth": round(_clamp(_safe_float(src.get("cad_smooth"), 0.30), 0.0, 1.0), 3),
         }
     )
     return cfg
@@ -435,6 +458,19 @@ def _handle_serial_line(line: str) -> None:
             sensor_data["serial_connected"] = True
             sensor_data["last_update"] = time.time()
     elif line.startswith("[") or line.startswith("$"):
+        if line.startswith("[STATUS] "):
+            # The boot banner ($HELLO) is usually gone before we reopen the
+            # port, so take the firmware version and reset reason from STATUS,
+            # which we request on every connect.
+            fields = dict(f.split(":", 1) for f in line[9:].split(",") if ":" in f)
+            if fields.get("FW"):
+                with data_lock:
+                    sensor_data["fw_version"] = fields["FW"].strip()
+            try:
+                if int(fields.get("RST", "0"), 16) & 0x2:
+                    LOGGER.warning("Feather last reset was a WATCHDOG reset")
+            except ValueError:
+                pass
         LOGGER.info("feather %s", line)
 
 
@@ -521,6 +557,11 @@ def parse_data_line(line: str) -> Optional[dict]:
                 parsed["imu_ok"] = parts[13].strip() == "1"
             if len(parts) >= 15:
                 parsed["cad_real_spm"] = int(parts[14].strip())
+            # A NaN/inf from the Feather would poison the display smoother for
+            # good (no reset path) — drop the whole line instead.
+            if not all(math.isfinite(v) for v in parsed.values()
+                       if isinstance(v, float)):
+                return None
             return parsed
     except Exception:
         LOGGER.debug("Failed to parse serial data line: %r", line, exc_info=True)
@@ -698,10 +739,24 @@ class DisplaySmoother:
             else:
                 self.s_speed = self.alpha * speed_kmh + (1 - self.alpha) * self.s_speed
                 self.s_cadence = self.alpha * cadence + (1 - self.alpha) * self.s_cadence
-        self.s_inclin = self.alpha * inclin + (1 - self.alpha) * self.s_inclin
+        # Incline: the Feather already removes footfall spikes, so follow a
+        # real change quickly (the old fixed 0.25 at 1 Hz took ~10 s to settle)
+        # and only smooth gently when the value is essentially steady.
+        a_inc = self.INCLIN_ALPHA_FAST if abs(inclin - self.s_inclin) > self.INCLIN_FAST_PCT else self.alpha
+        self.s_inclin = a_inc * inclin + (1 - a_inc) * self.s_inclin
+        # Displayed in 0.5 % steps with hysteresis: the step only changes once
+        # the smoothed value is clearly closer to another one, so a value
+        # sitting between two steps doesn't flicker.
+        if abs(self.s_inclin - self.inclin_step) > self.INCLIN_STEP_HYST:
+            self.inclin_step = round(self.s_inclin * 2.0) / 2.0
+
+    INCLIN_ALPHA_FAST = 0.7
+    INCLIN_FAST_PCT = 0.3
+    INCLIN_STEP_HYST = 0.35
+    inclin_step = 0.0
 
     def get(self) -> tuple[float, float, int]:
-        return self.s_speed, self.s_inclin, int(round(self.s_cadence))
+        return self.s_speed, self.inclin_step, int(round(self.s_cadence))
 
 
 class ActivityLogger:
@@ -944,8 +999,7 @@ class App:
             self._disp_cad_conf = det_conf
             cad_in = det_spm if det_fresh else raw["cadence"]
             self.smoother.update(raw_speed, raw_inclin, cad_in)
-            speed, inclin, cadence = self.smoother.get()
-            inclin = round(inclin * 2.0) / 2.0
+            speed, inclin, cadence = self.smoother.get()   # incline in 0.5 % steps
 
             # Distance: accumulate the Feather counter's delta (immune to a
             # counter reset/reboot — a negative or huge jump contributes 0).
@@ -982,7 +1036,14 @@ class App:
             self._tick_auto_pause(speed)
             if self.screen == self.SCREEN_RUN:
                 elapsed = self._elapsed_unlocked()
-                self.logger.log(elapsed, raw, self.cfg, inclin_corr=raw_inclin)
+                # Log the run's OWN distance, not the Feather's since-boot
+                # counter: that one carries metres from before Start and falls
+                # back to 0 if the Feather reboots mid-run (watchdog), which
+                # made the exported distance wrong / go backwards. Stored
+                # un-scaled because the exporter multiplies by pace_factor.
+                log_raw = dict(raw)
+                log_raw["distance_m"] = self._dist_accum / self.cfg["pace_factor"]
+                self.logger.log(elapsed, log_raw, self.cfg, inclin_corr=raw_inclin)
                 delta = distance - self.prev_distance
                 self.prev_distance = distance
                 d_alt = elevation_delta(delta, inclin)
@@ -1036,6 +1097,9 @@ class App:
                 "live_hr": hr["bpm"],
                 "hr_connected": hr["connected"],
                 "hr_state": hr.get("state", "dead"),
+                "hr_device": hr.get("device_name", "") if hr["connected"] else "",
+                "hr_detail": hr.get("detail", ""),
+                "hr_heard": hr.get("heard_name", ""),
                 "distance_m": round(self._disp_distance, 2),
                 "elapsed_sec": round(self._elapsed_unlocked(), 1),
                 "cadence": self._disp_cadence,
@@ -1049,7 +1113,7 @@ class App:
                 "route_min_km": route_min_km,
                 "route_max_km": route_max_km,
                 "hr_zone_max": int(self.cfg.get("hr_max", 198)),
-                "hr_zone_rest": int(self.cfg.get("hr_rest", 64)),
+                "hr_zone_rest": int(self.cfg.get("hr_rest", 56)),
                 "auto_paused": self.auto_paused,
                 "ref_speed": self.ref_speed,
                 "calib_state": self.calib_state,
@@ -1170,6 +1234,7 @@ class App:
             return
         self.session_start = time.time()
         self.auto_paused = False
+        self.speed_zero_since = 0.0   # else a stopped belt re-pauses at once
         self.screen = self.SCREEN_RUN
 
     def _start(self) -> None:

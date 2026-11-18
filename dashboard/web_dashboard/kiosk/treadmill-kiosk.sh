@@ -63,7 +63,7 @@ exec "$CHROME" \
   --noerrdialogs \
   --disable-translate \
   --disable-infobars \
-  --disable-features=TranslateUI,OverscrollHistoryNavigation \
+  --disable-features=Translate,TranslateUI,OverscrollHistoryNavigation,PasswordManagerEnabled \
   --no-first-run \
   --fast \
   --fast-start \
@@ -72,7 +72,6 @@ exec "$CHROME" \
   --check-for-update-interval=31536000 \
   --password-store=basic \
   --disable-sync \
-  --disable-features=PasswordManagerEnabled \
   --user-data-dir="$PROFILE" \
   --window-size=800,480 \
   --window-position=0,0 \

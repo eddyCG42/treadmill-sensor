@@ -1,6 +1,6 @@
 #!/bin/bash
 # ----------------------------------------------------------------------
-# Treadmill Dashboard v9 — one-shot deployment on the Pi.
+# Treadmill Dashboard v12 — one-shot deployment on the Pi.
 #
 # Run this AFTER you have copied the web_dashboard/ folder to
 # ~/treadmill_dashboard/web_dashboard/.
@@ -72,14 +72,14 @@ EOF
 }
 
 echo "===================================================================="
-echo " Treadmill Dashboard v9 deployment — user=$USER_NAME"
+echo " Treadmill Dashboard v12 deployment — user=$USER_NAME"
 echo "===================================================================="
 
 # -------- 1. Sanity --------
 echo "[1/7] Checking layout…"
 [ -d "$WEB" ] || { echo "  ERROR: $WEB not found. Copy web_dashboard/ there first."; exit 1; }
 [ -f "$WEB/treadmill_server.py" ] || { echo "  ERROR: treadmill_server.py missing."; exit 1; }
-for m in treadmill_export.py treadmill_strava.py treadmill_hr.py; do
+for m in treadmill_metrics.py treadmill_cadence.py treadmill_export.py treadmill_strava.py treadmill_hr.py; do
   if [ ! -f "$ROOT/$m" ]; then
     echo "  WARN: $ROOT/$m missing — features depending on it will be disabled."
   else
@@ -104,17 +104,48 @@ if [ -z "$CHROMIUM_PKG" ]; then
   exit 1
 fi
 echo "  → installed $CHROMIUM_PKG"
-sudo apt install -y -qq python3-serial unclutter curl x11-xserver-utils
+sudo apt install -y -qq python3-serial python3-bleak python3-requests unclutter curl x11-xserver-utils
 
 # Persistent journal: Pi OS keeps it in RAM by default, so every reboot wiped
 # the evidence of a dropout or an HR failure. Capped to spare the SD card.
-if [ ! -d /var/log/journal ]; then
+# Test the drop-in, not the directory: /var/log/journal already exists on Pi
+# OS while 40-rpi-volatile-storage.conf still forces Storage=volatile, so the
+# old directory test skipped this block and the journal stayed in RAM.
+if [ ! -f /etc/systemd/journald.conf.d/treadmill.conf ]; then
   echo "  enabling persistent journal (/var/log/journal, max 200M)"
   sudo mkdir -p /var/log/journal /etc/systemd/journald.conf.d
   printf '[Journal]\nStorage=persistent\nSystemMaxUse=200M\n' \
     | sudo tee /etc/systemd/journald.conf.d/treadmill.conf > /dev/null
   sudo systemd-tmpfiles --create --prefix /var/log/journal
   sudo systemctl restart systemd-journald
+fi
+
+# rpi-connect 2.11 ships a PathExists= trigger on auth.key that re-runs the
+# oneshot "signin" ~20 times a second forever once signed in: constant fork
+# load on a Pi 3B+ and enough log spam to rotate the journal in minutes.
+# Masking only the trigger keeps Raspberry Pi Connect itself working.
+if systemctl --user cat rpi-connect-signin.path > /dev/null 2>&1 \
+   && [ "$(systemctl --user is-enabled rpi-connect-signin.path 2>/dev/null)" != "masked" ]; then
+  echo "  masking the looping rpi-connect-signin.path trigger"
+  systemctl --user mask --now rpi-connect-signin.path
+fi
+
+# Let the dashboard user restart bluetooth.service (and only that) without
+# sudo: treadmill_hr.py does it when a strap is heard but refuses the link for
+# minutes, and the server unit runs with NoNewPrivileges.
+POLKIT_RULE=/etc/polkit-1/rules.d/49-treadmill-bluetooth.rules
+if ! sudo test -f "$POLKIT_RULE"; then
+  echo "  allowing $(id -un) to restart bluetooth.service (polkit)"
+  sudo tee "$POLKIT_RULE" > /dev/null <<EOF
+polkit.addRule(function(action, subject) {
+  if (action.id == "org.freedesktop.systemd1.manage-units" &&
+      action.lookup("unit") == "bluetooth.service" &&
+      action.lookup("verb") == "restart" &&
+      subject.user == "$(id -un)") {
+    return polkit.Result.YES;
+  }
+});
+EOF
 fi
 
 # Never let the kernel autosuspend the Feather's USB link (Adafruit VID 239a).
@@ -165,7 +196,9 @@ if [ ! -f "$HOME_DIR/treadmill_config.json" ]; then
 fi
 create_server_unit | sudo tee "$SERVICE_DST" > /dev/null
 sudo systemctl daemon-reload
-sudo systemctl enable --now treadmill-server.service
+sudo systemctl enable treadmill-server.service
+# restart, not just start: an already-running server must pick up the new code
+sudo systemctl restart treadmill-server.service
 
 # -------- 6. Smoke test --------
 echo "[6/7] Waiting for HTTP server to come up…"

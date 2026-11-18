@@ -181,8 +181,9 @@ function ModeBadge({ mode, compact = false, onClick = null }) {
 // HR ring — visualizes current zone.
 function HRRing({ bpm, size = 60 }) {
   const c = hrColor(bpm);
-  // Fill spans resting→max HR (64→198) so the ring tracks % HR reserve.
-  const pct = Math.min(1, Math.max(0, (bpm - 64) / (198 - 64)));
+  // Fill spans resting→max HR (HR_REST→HR_MAX, tokens.jsx) so the ring tracks
+  // % HR reserve.
+  const pct = Math.min(1, Math.max(0, (bpm - HR_REST) / (HR_MAX - HR_REST)));
   const r = (size - 8) / 2;
   const circ = 2 * Math.PI * r;
   return (
@@ -213,12 +214,30 @@ function StatusItem({ label, color, value, pulse = false }) {
 // HR chip props from /api/state: green connected, pulsing amber while
 // searching/connecting, red when Bluetooth or the HR manager is broken (a grey
 // dot used to hide all of these behind the same "not connected").
+// The value text says *why* before the run starts: which strap is connected
+// (with bpm), "REFUSÉE" when a strap is on air but the link keeps failing,
+// "AUCUNE" when no strap was heard at all.
+function hrShortName(name) {
+  const n = (name || '').split(':')[0].replace(/heart rate/i, '').trim();
+  return (n.split(' ')[0] || '').slice(0, 9);
+}
 function hrStatusProps(data) {
   const st = data.hr_state || (data.hr_connected ? 'connected' : 'scanning');
-  if (data.hr_connected || st === 'connected') return { color: TOKENS.green };
-  if (st === 'adapter_error') return { color: TOKENS.red, pulse: true, value: 'BT' };
-  if (st === 'dead') return { color: TOKENS.red, value: 'OFF' };
-  return { color: TOKENS.amber, pulse: true };
+  if (data.hr_connected || st === 'connected') {
+    const name = hrShortName(data.hr_device);
+    const bpm = data.live_hr > 0 ? String(data.live_hr) : '';
+    // Linked but no heartbeat yet (strap not worn, or just connected): amber.
+    if (!bpm) return { color: TOKENS.amber, pulse: true, value: (name + ' --').trim(), text: (name + ' sans signal').trim() };
+    return { color: TOKENS.green, value: (name + ' ' + bpm).trim(), text: name };
+  }
+  if (st === 'adapter_error') return { color: TOKENS.red, pulse: true, value: 'BT', text: 'BLUETOOTH HS' };
+  if (st === 'dead') return { color: TOKENS.red, value: 'OFF', text: 'ARRÊTÉ' };
+  if (data.hr_detail === 'refused') {
+    const v = (hrShortName(data.hr_heard) + ' REFUSÉE').trim();
+    return { color: TOKENS.red, pulse: true, value: v, text: v };
+  }
+  if (data.hr_detail === 'no_strap') return { color: TOKENS.amber, pulse: true, value: 'AUCUNE', text: 'AUCUNE CEINTURE' };
+  return { color: TOKENS.amber, pulse: true, value: '…', text: 'RECHERCHE' };
 }
 
 Object.assign(window, { Btn, Panel, Label, Metric, Dot, Stepper, ModeBadge, HRRing, StatusItem, hrStatusProps });

@@ -15,7 +15,7 @@ function StatusBar({ state, data = {} }) {
   const stateLabel = {
     IDLE: 'IDLE',
     RUNNING: 'REC',
-    PAUSED: 'AUTO-PAUSE'
+    PAUSED: 'PAUSE'
   };
   const bleOn = data.ble_on;
   const usbColor = data.usb_connected ? TOKENS.green : TOKENS.textFaint;
