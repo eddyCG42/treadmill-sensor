@@ -127,8 +127,9 @@ function Dot({ color, pulse = false }) {
       height: 8,
       borderRadius: '50%',
       background: color,
-      boxShadow: pulse ? `0 0 0 0 ${color}` : 'none',
-      animation: pulse ? 'pulse 1.4s infinite' : 'none',
+      // "pulse" = searching/attention. Static halo, never an animation (see
+      // the note in dashboard.html: animating this dot cost a whole CPU core).
+      boxShadow: pulse ? `0 0 0 3px ${color}55` : 'none',
       flexShrink: 0,
     }} />
   );

@@ -417,9 +417,33 @@ def feather_param_items(cfg: dict) -> list[tuple[str, str]]:
 
 
 def _readline(sp: "serial.Serial") -> Optional[str]:
-    """One decoded line, "" on timeout, None on error."""
+    """One decoded line, "" on timeout, None on error.
+
+    pyserial's readline() pulls one byte per call (a select + a read each);
+    with the 100 Hz $RAW stream that was ~4000 Python round trips a second and
+    the server's main CPU cost. Read whatever is waiting in one go and split
+    lines here; the buffers live on the port object, so a reopen starts clean."""
     try:
-        return sp.readline().decode("utf-8", errors="ignore").strip()
+        state = sp.__dict__
+        lines = state.setdefault("_tm_lines", [])
+        buf = state.setdefault("_tm_buf", bytearray())
+        deadline = time.monotonic() + (sp.timeout or 0)
+        while not lines:
+            chunk = sp.read(sp.in_waiting or 1)   # blocks up to sp.timeout
+            if chunk:
+                buf += chunk
+                if b"\n" in buf:
+                    *full, rest = bytes(buf).split(b"\n")
+                    buf[:] = rest
+                    lines.extend(reversed(full))
+                elif len(buf) > 8192:           # garbage with no newline
+                    del buf[:]
+            if not chunk or time.monotonic() >= deadline:
+                break
+        if not lines:
+            return ""
+        # lines is stored reversed so pop() hands them back in arrival order
+        return lines.pop().decode("utf-8", errors="ignore").strip()
     except Exception:
         return None
 

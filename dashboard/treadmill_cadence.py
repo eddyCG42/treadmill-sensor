@@ -29,6 +29,13 @@ cadence() is read from the tick thread. A small lock guards the published value.
 from __future__ import annotations
 
 import math
+from operator import mul as _mul
+
+try:                                   # Python >= 3.12 (the Pi runs 3.13)
+    _sumprod = math.sumprod
+except AttributeError:                 # older interpreters: same result, slower
+    def _sumprod(a, b):
+        return sum(map(_mul, a, b))
 import threading
 from collections import deque
 from typing import Callable, Optional
@@ -65,6 +72,10 @@ _DEFAULTS = {
     "cad_hold_ms": 2500,     # hold last cadence this long after losing rhythm
     "cad_smooth": 0.30,      # output EMA weight on each new valid estimate
 }
+
+
+# Median belt speed (m/s) under which the detector does not even try.
+_BELT_STOPPED_MS = 0.2
 
 
 class CadenceDetector:
@@ -183,7 +194,12 @@ class CadenceDetector:
         kmh = v_ms * 3.6
         mu, sig = _prior_cadence(kmh)
 
-        cad, conf = self._acf(band, dt, mu)
+        # Belt stopped: nobody is stepping, so skip the autocorrelation (the
+        # costliest thing the server does, 4x a second) and report "no cadence".
+        if v_ms < _BELT_STOPPED_MS:
+            cad, conf = 0.0, 0.0
+        else:
+            cad, conf = self._acf(band, dt, mu)
 
         sl = (2.0 * v_ms) / (cad / 60.0) if cad > 0 else 0.0  # implied stride (m)
         conf_min = float(self._cfg("cad_conf_min"))
@@ -224,11 +240,9 @@ class CadenceDetector:
         peaks = []
         p2 = p1 = None
         for lag in range(lag_min, lag_max + 1):
-            s = 0.0
-            # inner correlation; local, tight loop
-            for k in range(n - lag):
-                s += x[k] * x[k + lag]
-            val = s / denom
+            # Inner correlation sum(x[k] * x[k + lag]) done in C instead of
+            # a Python loop (was the server's costliest computation).
+            val = _sumprod(x[:n - lag], x[lag:]) / denom
             if p1 is not None and p2 is not None and p1 > p2 and p1 >= val and p1 > 0:
                 peaks.append((lag - 1, p1))
             p2, p1 = p1, val

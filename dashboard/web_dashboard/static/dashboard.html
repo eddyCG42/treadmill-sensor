@@ -24,11 +24,10 @@
   }
   * { box-sizing: border-box; }
   button { font-family: inherit; }
-  @keyframes pulse {
-    0%   { box-shadow: 0 0 0 0 currentColor; }
-    70%  { box-shadow: 0 0 0 6px rgba(0,0,0,0); }
-    100% { box-shadow: 0 0 0 0 rgba(0,0,0,0); }
-  }
+  /* No CSS animation anywhere on purpose: on the Pi 3B+ (software compositor,
+     rotated panel) a single pulsing status dot kept labwc at ~94 % of a core
+     and Chromium ticking at 60 fps. Measured 2026-11-17: idle CPU 47 % with
+     the pulse (smooth or steps()), 70 % without. "Pulse" is now a static halo. */
   .stage {
     position: fixed; inset: 0;
     background: #06080c;

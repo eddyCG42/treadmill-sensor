@@ -154,7 +154,7 @@ treadmill-sensor/
 │   └── BOM.md                       ← Bill of materials
 ├── firmware/
 │   └── feather-nrf52840/
-│       └── treadmill_sensor_v11_21.ino   ← Arduino sketch (internal v12.1)
+│       └── treadmill_sensor_v11_21.ino   ← Arduino sketch (internal v12.2)
 ├── dashboard/
 │   ├── treadmill_cadence.py         ← Pi-side footfall / cadence detector
 │   ├── treadmill_metrics.py         ← shared speed / incline / elevation math
@@ -254,6 +254,53 @@ In short:
 5. Flash the bootloader with `SD_NAME=s340` using a J-Link
 
 > ⚠️ The evaluation key is for development only. A commercial license key from Garmin/Dynastream is required for any product release.
+
+### Bootloader on the reference board
+
+Read from the board itself: double-tap reset, open the `FTHR840BOOT` drive and
+look at `INFO_UF2.TXT`.
+
+| | |
+|---|---|
+| UF2 Bootloader | `0.10.0` (built Feb 14 2026) |
+| Model / Board-ID | Adafruit Feather nRF52840 Express / `nRF52840-Feather-revE` |
+| SoftDevice | **S340 7.0.1** |
+| Application start | `0x31000` |
+| DFU `softdevice_req` | `0xCE` (206) |
+
+### A build for the stock S140 will not flash
+
+The stock Adafruit nRF52 core and PlatformIO's `adafruit_feather_nrf52840`
+board both target **S140 6.1.1**: the application is linked at `0x26000` and
+the DFU package carries `softdevice_req = 0xB6` (182). Such a package
+does not match this bootloader's SoftDevice, and the image would sit at the
+wrong address anyway. Only a
+build made with the S340-modified core works.
+
+Check a package before flashing — `manifest.json` inside the `.zip` must say
+`"softdevice_req": [206]`:
+
+```bash
+unzip -p treadmill_sensor_v11_21.ino.zip manifest.json
+```
+
+### Flashing over USB from the Pi
+
+Stop the dashboard server first. It holds `/dev/ttyACM0` and keeps writing
+`SET …` commands to it, including while the Feather sits in its bootloader.
+
+```bash
+sudo systemctl stop treadmill-server
+adafruit-nrfutil --verbose dfu serial \
+  --package treadmill_sensor_v11_21.ino.zip \
+  -p /dev/ttyACM0 -b 115200 --singlebank --touch 1200
+sudo systemctl start treadmill-server
+```
+
+The running version is the `FW:` field of the `[STATUS]` line in
+`journalctl -u treadmill-server`, and `fw_version` in `/api/state`. If an
+upload aborts, double-tap reset to get back into the bootloader — it is never
+overwritten by an application DFU.
 
 ---
 
