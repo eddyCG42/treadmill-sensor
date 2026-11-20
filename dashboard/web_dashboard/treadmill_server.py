@@ -481,6 +481,9 @@ def _handle_serial_line(line: str) -> None:
             sensor_data.update(parsed)
             sensor_data["serial_connected"] = True
             sensor_data["last_update"] = time.time()
+            # Monotonic twin for the serial watchdog: the Pi has no RTC, so
+            # the NTP step after boot must not look like days of silence.
+            sensor_data["last_update_mono"] = time.monotonic()
     elif line.startswith("[") or line.startswith("$"):
         if line.startswith("[STATUS] "):
             # The boot banner ($HELLO) is usually gone before we reopen the
@@ -701,7 +704,7 @@ def serial_thread_fn() -> None:
             # line state lost after a bus reset) never raises, so readline just
             # times out forever. Reopen when $DATA stops or a write timed out —
             # close/reopen re-asserts DTR and re-runs the sync.
-            opened_at = time.time()
+            opened_at = time.monotonic()
             while sp.is_open:
                 line = _readline(sp)
                 if line is None:
@@ -709,8 +712,8 @@ def serial_thread_fn() -> None:
                 if line:
                     _handle_serial_line(line)
                 with data_lock:
-                    last_data = sensor_data.get("last_update", 0.0)
-                silent_s = time.time() - max(last_data, opened_at)
+                    last_data = sensor_data.get("last_update_mono", 0.0)
+                silent_s = time.monotonic() - max(last_data, opened_at)
                 if last_data > opened_at:
                     mute_reopens = 0
                 if silent_s > SERIAL_SILENCE_REOPEN_S:
@@ -983,7 +986,7 @@ class App:
 
     def _elapsed_unlocked(self) -> float:
         if self.screen == self.SCREEN_RUN and self.session_start is not None:
-            return self.elapsed_at_pause + (time.time() - self.session_start)
+            return self.elapsed_at_pause + (time.monotonic() - self.session_start)
         return self.elapsed_at_pause
 
     def tick(self) -> None:
@@ -1213,7 +1216,7 @@ class App:
     def _tick_auto_pause(self, speed: float) -> None:
         if not self.auto_pause:
             return
-        now = time.time()
+        now = time.monotonic()
         if speed < 0.2:
             if self.speed_zero_since == 0.0:
                 self.speed_zero_since = now
@@ -1245,7 +1248,7 @@ class App:
         if self.screen != self.SCREEN_RUN:
             return
         if self.session_start is not None:
-            self.elapsed_at_pause += time.time() - self.session_start
+            self.elapsed_at_pause += time.monotonic() - self.session_start
         self.session_start = None
         self.auto_paused = auto
         self.screen = self.SCREEN_PAUSED
@@ -1256,7 +1259,7 @@ class App:
         if not self._sensor_available():
             self._note("Capteur USB indisponible")
             return
-        self.session_start = time.time()
+        self.session_start = time.monotonic()
         self.auto_paused = False
         self.speed_zero_since = 0.0   # else a stopped belt re-pauses at once
         self.screen = self.SCREEN_RUN
@@ -1282,7 +1285,7 @@ class App:
         if len(self.cfg.get("inclin_points") or {}) < 2:
             self._note("Calibration inclinaison conseillee (>=2 points)")
 
-        self.session_start = time.time()
+        self.session_start = time.monotonic()
         self.elapsed_at_pause = 0.0
         # Baseline distance accumulation on the Feather's current counter value
         # (no RESET_DIST round-trip to depend on — see tick()).
@@ -1600,7 +1603,11 @@ class Handler(BaseHTTPRequestHandler):
             for key, value in headers.items():
                 self.send_header(key, value)
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            # The dashboard aborted its poll (timeout / screen change): not an error.
+            pass
 
     def _send_json(self, obj: dict, code: int = 200) -> None:
         # A NaN/Infinity would serialise as invalid JSON and r.json() in the

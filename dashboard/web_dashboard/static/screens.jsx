@@ -196,7 +196,49 @@ function RunHeader({ state, mode, paceMult, onPause, onResume, onStop }) {
 
 // ---------- SAVE / SUMMARY SCREEN ----------
 // Replaces the confusing PISTE/SAVE/ANNULER row with a clear summary.
-function SaveScreen({ session, mode, onSave, onDiscard, onResume }) {
+// The route type is confirmed HERE, right before saving: it only matters at
+// export time (which route the activity is drawn on), so the choice made on
+// the home screen can be corrected once the run is done.
+function SaveModeChoice({ mode, setMode }) {
+  const opts = [
+    { id: 'piste', label: 'PISTE', color: TOKENS.modePiste },
+    { id: 'random', label: 'RANDOM', color: TOKENS.modeRandom },
+  ];
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+      <div style={{ fontSize: 10, color: TOKENS.textFaint, letterSpacing: 1, fontWeight: 700, textAlign: 'right', lineHeight: 1.3 }}>
+        PARCOURS<br />À ENREGISTRER
+      </div>
+      {opts.map((o) => {
+        const active = mode === o.id;
+        return (
+          <div
+            key={o.id}
+            onClick={() => { if (!active) setMode(o.id); }}
+            style={{
+              minWidth: 112, height: 48, padding: '0 12px', boxSizing: 'border-box',
+              display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8,
+              borderRadius: 12, cursor: 'pointer',
+              background: active ? `${o.color}26` : TOKENS.bgPanel,
+              border: `2px solid ${active ? o.color : TOKENS.border}`,
+            }}
+          >
+            <span style={{
+              width: 12, height: 12, borderRadius: '50%', boxSizing: 'border-box',
+              border: `2px solid ${active ? o.color : TOKENS.borderStrong}`,
+              background: active ? o.color : 'transparent',
+            }} />
+            <span style={{ fontSize: 15, fontWeight: 800, letterSpacing: 1, color: active ? o.color : TOKENS.textDim }}>
+              {o.label}
+            </span>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function SaveScreen({ session, mode, setMode = () => {}, onSave, onDiscard, onResume }) {
   const dist = fmtDist(session.distance);
   // distance is in metres, elapsedSec in seconds -> m/s * 3.6 = km/h.
   // (was * 3600, which yielded a nonsense speed and a 0:00 pace.)
@@ -207,9 +249,9 @@ function SaveScreen({ session, mode, onSave, onDiscard, onResume }) {
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
         <div>
           <div style={{ fontSize: 24, fontWeight: 800, color: TOKENS.text, letterSpacing: 1 }}>RÉSUMÉ DE L'ACTIVITÉ</div>
-          <div style={{ fontSize: 12, color: TOKENS.textDim, marginTop: 2 }}>Vérifie avant de sauvegarder</div>
+          <div style={{ fontSize: 12, color: TOKENS.textDim, marginTop: 2 }}>Vérifie le parcours avant de sauvegarder</div>
         </div>
-        <ModeBadge mode={mode} />
+        <SaveModeChoice mode={mode} setMode={setMode} />
       </div>
 
       {/* Big stats grid — top row larger, bottom row tighter */}

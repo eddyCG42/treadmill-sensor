@@ -244,7 +244,11 @@ class CadenceDetector:
             # a Python loop (was the server's costliest computation).
             val = _sumprod(x[:n - lag], x[lag:]) / denom
             if p1 is not None and p2 is not None and p1 > p2 and p1 >= val and p1 > 0:
-                peaks.append((lag - 1, p1))
+                # Parabolic interpolation of the peak: at 100 Hz an integer lag
+                # only resolves ~4-5 spm around 170 (lag 35 = 171, lag 36 = 167).
+                curv = p2 - 2.0 * p1 + val
+                off = 0.5 * (p2 - val) / curv if curv < 0 else 0.0
+                peaks.append((lag - 1 + max(-0.5, min(0.5, off)), p1))
             p2, p1 = p1, val
         if not peaks:
             return 0.0, 0.0

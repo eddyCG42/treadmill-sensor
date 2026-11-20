@@ -326,6 +326,7 @@ function App() {
     body = (
       <SaveScreen
         session={session} mode={mode}
+        setMode={(m) => apiCmd('set_mode', { mode: m })}
         onSave={() => apiCmd('save')}
         onDiscard={() => apiCmd('discard')}
         onResume={() => apiCmd('resume_from_save')}
